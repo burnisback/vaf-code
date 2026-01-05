@@ -307,11 +307,13 @@ function IDELayoutInner({ template, projectName }: IDELayoutInnerProps) {
     }
   };
 
-  return (
-    <div className="h-screen w-screen flex bg-[var(--color-surface-primary)] overflow-hidden relative">
-      {/* Loading Overlay */}
-      <LoadingOverlay projectName={projectName} />
+  // Don't render IDE panels while loading - show only the loading overlay
+  if (loadingState !== 'ready') {
+    return <LoadingOverlay projectName={projectName} />;
+  }
 
+  return (
+    <div className="h-screen w-screen flex bg-[var(--color-surface-primary)] overflow-hidden">
       {/* LEFT: Chat Panel */}
       <div className="w-[380px] h-full flex-shrink-0 border-r border-[var(--color-border-default)]">
         <ChatPanel />
