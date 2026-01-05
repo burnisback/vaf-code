@@ -44,7 +44,7 @@ function LoadingOverlay({ projectName }: { projectName?: string }) {
 
   if (error) {
     return (
-      <div className="absolute inset-0 z-50 flex items-center justify-center bg-[var(--color-surface-primary)]">
+      <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-[var(--color-surface-primary)]">
         <div className="text-center max-w-md px-6">
           <div className="w-16 h-16 mx-auto mb-6 rounded-full bg-red-500/10 flex items-center justify-center">
             <AlertCircle className="w-8 h-8 text-red-500" />
@@ -68,7 +68,7 @@ function LoadingOverlay({ projectName }: { projectName?: string }) {
   }
 
   return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-[var(--color-surface-primary)]">
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-[var(--color-surface-primary)]">
       <div className="text-center max-w-md px-6">
         <div className="w-16 h-16 mx-auto mb-6 rounded-full bg-[var(--color-accent-primary)]/10 flex items-center justify-center">
           <Loader2 className="w-8 h-8 text-[var(--color-accent-primary)] animate-spin" />
