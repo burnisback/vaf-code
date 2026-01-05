@@ -1,0 +1,80 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // ============================================
+    // Helper Functions
+    // ============================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    function isValidImage() {
+      return request.resource.contentType.matches('image/.*');
+    }
+
+    function isUnder2MB() {
+      return request.resource.size < 2 * 1024 * 1024;
+    }
+
+    function isUnder10MB() {
+      return request.resource.size < 10 * 1024 * 1024;
+    }
+
+    // ============================================
+    // User Avatars
+    // ============================================
+    match /users/{userId}/avatar/{fileName} {
+      // Anyone can view avatars (for public profiles)
+      allow read: if true;
+
+      // Only owner can upload their avatar
+      allow write: if isOwner(userId) &&
+        isValidImage() &&
+        isUnder2MB();
+
+      // Owner can delete their avatar
+      allow delete: if isOwner(userId);
+    }
+
+    // ============================================
+    // Project Files
+    // ============================================
+    match /projects/{projectId}/{allPaths=**} {
+      // Authenticated users can read project files
+      // Note: Fine-grained ownership check via Cloud Functions
+      allow read: if isAuthenticated();
+
+      // Authenticated users can write project files
+      // Note: Ownership validated at Firestore level
+      allow write: if isAuthenticated() && isUnder10MB();
+
+      allow delete: if isAuthenticated();
+    }
+
+    // ============================================
+    // Templates (Public Read, Admin Write)
+    // ============================================
+    match /templates/{templateId}/{allPaths=**} {
+      // Anyone can read template files
+      allow read: if true;
+
+      // Only backend can write template files
+      allow write: if false;
+    }
+
+    // ============================================
+    // Temporary Uploads (for processing)
+    // ============================================
+    match /temp/{userId}/{allPaths=**} {
+      allow read: if isOwner(userId);
+      allow write: if isOwner(userId) && isUnder10MB();
+      allow delete: if isOwner(userId);
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "projects": {
+    "default": "vaf-system",
+    "staging": "vaf-system-staging",
+    "production": "vaf-system"
+  },
+  "targets": {},
+  "etags": {}
+}

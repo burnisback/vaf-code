@@ -1,0 +1,146 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ============================================
+    // Helper Functions
+    // ============================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    function isValidTimestamp(field) {
+      return field is timestamp;
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    // ============================================
+    // Users Collection
+    // ============================================
+    match /users/{userId} {
+      // Users can read their own profile
+      allow read: if isOwner(userId);
+
+      // Users can create their own profile (during signup)
+      allow create: if isOwner(userId) &&
+        hasRequiredFields(['id', 'email', 'name', 'createdAt']) &&
+        request.resource.data.id == userId;
+
+      // Users can update their own profile (limited fields)
+      allow update: if isOwner(userId) &&
+        // Cannot change id, email, or createdAt
+        request.resource.data.id == resource.data.id &&
+        request.resource.data.email == resource.data.email &&
+        request.resource.data.createdAt == resource.data.createdAt;
+
+      // No self-deletion (admin only via backend)
+      allow delete: if false;
+
+      // ----------------------------------------
+      // User Preferences Subcollection
+      // ----------------------------------------
+      match /preferences/{docId} {
+        allow read: if isOwner(userId);
+        allow write: if isOwner(userId);
+      }
+
+      // ----------------------------------------
+      // Chat Sessions Subcollection
+      // ----------------------------------------
+      match /chatSessions/{sessionId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId);
+        allow update: if isOwner(userId);
+        allow delete: if false; // Preserve chat history
+
+        // Chat Messages (immutable once created)
+        match /messages/{messageId} {
+          allow read: if isOwner(userId);
+          allow create: if isOwner(userId) &&
+            hasRequiredFields(['role', 'content', 'createdAt']) &&
+            request.resource.data.role in ['user', 'assistant', 'system'];
+          // Messages cannot be updated or deleted
+          allow update, delete: if false;
+        }
+      }
+    }
+
+    // ============================================
+    // Projects Collection
+    // ============================================
+    match /projects/{projectId} {
+      // Owner can read their projects
+      allow read: if isAuthenticated() &&
+        resource.data.userId == request.auth.uid;
+
+      // Owner can create projects (with valid userId)
+      allow create: if isAuthenticated() &&
+        request.resource.data.userId == request.auth.uid &&
+        hasRequiredFields(['userId', 'name', 'status', 'createdAt', 'updatedAt']);
+
+      // Owner can update their projects
+      allow update: if isAuthenticated() &&
+        resource.data.userId == request.auth.uid &&
+        // Cannot change ownership
+        request.resource.data.userId == resource.data.userId;
+
+      // No hard deletes (use soft delete via update with deletedAt)
+      allow delete: if false;
+
+      // ----------------------------------------
+      // Project Files Subcollection
+      // ----------------------------------------
+      match /files/{fileId} {
+        // Check project ownership for file access
+        allow read: if isAuthenticated() &&
+          get(/databases/$(database)/documents/projects/$(projectId)).data.userId == request.auth.uid;
+
+        allow write: if isAuthenticated() &&
+          get(/databases/$(database)/documents/projects/$(projectId)).data.userId == request.auth.uid;
+      }
+    }
+
+    // ============================================
+    // Templates Collection (Public Read)
+    // ============================================
+    match /templates/{templateId} {
+      // Anyone can read templates (even unauthenticated for marketing)
+      allow read: if true;
+
+      // Only backend/admin can write templates
+      allow write: if false;
+    }
+
+    // ============================================
+    // Usage Collection (Backend Write Only)
+    // ============================================
+    match /usage/{userId} {
+      // Users can read their own usage
+      allow read: if isOwner(userId);
+
+      // Only backend can write usage data
+      allow write: if false;
+
+      // Subcollections (daily, summary)
+      match /{document=**} {
+        allow read: if isOwner(userId);
+        allow write: if false;
+      }
+    }
+
+    // ============================================
+    // System Collections (Backend Only)
+    // ============================================
+    match /system/{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
