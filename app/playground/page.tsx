@@ -6,24 +6,25 @@ import dynamic from 'next/dynamic';
 import { Loader2 } from 'lucide-react';
 
 // Nice loading screen component matching the WebContainer loading overlay
+// Using hardcoded colors since CSS variables aren't available before app-theme is applied
 function LoadingScreen() {
   return (
-    <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-[var(--color-surface-primary)]">
+    <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-[#0a0a0a]">
       <div className="text-center max-w-md px-6">
-        <div className="w-16 h-16 mx-auto mb-6 rounded-full bg-[var(--color-accent-primary)]/10 flex items-center justify-center">
-          <Loader2 className="w-8 h-8 text-[var(--color-accent-primary)] animate-spin" />
+        <div className="w-16 h-16 mx-auto mb-6 rounded-full bg-[#007acc]/10 flex items-center justify-center">
+          <Loader2 className="w-8 h-8 text-[#007acc] animate-spin" />
         </div>
-        <h2 className="text-xl font-semibold text-[var(--color-text-primary)] mb-2">
+        <h2 className="text-xl font-semibold text-[#e5e5e5] mb-2">
           Setting up your project
         </h2>
-        <p className="text-sm text-[var(--color-text-secondary)] mb-6">
+        <p className="text-sm text-[#a0a0a0] mb-6">
           Initializing development environment...
         </p>
-        <div className="w-full h-2 bg-[var(--color-surface-tertiary)] rounded-full overflow-hidden">
-          <div className="h-full w-[10%] bg-[var(--color-accent-primary)] animate-pulse" />
+        <div className="w-full h-2 bg-[#1a1a1a] rounded-full overflow-hidden">
+          <div className="h-full w-[10%] bg-[#007acc] animate-pulse" />
         </div>
-        <div className="flex justify-between mt-4 text-xs text-[var(--color-text-tertiary)]">
-          <span className="text-[var(--color-accent-primary)]">Boot</span>
+        <div className="flex justify-between mt-4 text-xs text-[#808080]">
+          <span className="text-[#007acc]">Boot</span>
           <span>Setup</span>
           <span>Install</span>
           <span>Start</span>
