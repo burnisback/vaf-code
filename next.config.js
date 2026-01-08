@@ -2,7 +2,7 @@ const path = require('path');
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  output: 'export',
+  // Note: 'output: export' removed to enable API routes for AI chat
   trailingSlash: true,
   images: {
     unoptimized: true,
