@@ -1,5 +1,5 @@
 import { genkit } from 'genkit';
-import { googleAI, gemini20Flash, gemini20FlashExp, gemini15Pro } from '@genkit-ai/googleai';
+import { googleAI } from '@genkit-ai/google-genai';
 
 /**
  * Genkit AI Configuration
@@ -7,10 +7,12 @@ import { googleAI, gemini20Flash, gemini20FlashExp, gemini15Pro } from '@genkit-
  * This configures the Genkit AI framework with the Google AI (Gemini) plugin.
  * The GEMINI_API_KEY environment variable must be set for this to work.
  *
- * Available models:
- * - gemini-2.0-flash: Fast, efficient for most tasks (recommended)
- * - gemini-2.0-flash-exp: Latest experimental model
- * - gemini-1.5-pro: Most capable, best for complex reasoning
+ * Available models (2025):
+ * - gemini-2.5-flash: Fast, efficient for most tasks (recommended)
+ * - gemini-2.5-pro: Most capable, best for complex reasoning
+ * - gemini-2.5-flash-lite: Lightweight version for simple tasks
+ *
+ * @see https://genkit.dev/docs/plugins/google-genai
  */
 export const ai = genkit({
   plugins: [googleAI()],
@@ -19,20 +21,29 @@ export const ai = genkit({
 // Re-export for convenience
 export { googleAI };
 
-// Model references from @genkit-ai/googleai
+// Model references using the new googleAI.model() approach
+// This provides better type safety and automatic model discovery
 export const MODELS = {
   // Fast and efficient - default for most tasks
-  FLASH: gemini20Flash,
-  // Lightweight version for simple tasks (alias to FLASH)
-  FLASH_8B: gemini20Flash,
-  // Experimental - latest features
-  FLASH_EXP: gemini20FlashExp,
+  FLASH: googleAI.model('gemini-2.5-flash'),
+  // Lightweight version for simple tasks
+  FLASH_LITE: googleAI.model('gemini-2.5-flash-lite'),
+  // Alias for FLASH_LITE (backward compatibility)
+  FLASH_8B: googleAI.model('gemini-2.5-flash-lite'),
   // Most capable - for complex reasoning and planning
-  PRO: gemini15Pro,
+  PRO: googleAI.model('gemini-2.5-pro'),
+} as const;
+
+// Legacy aliases for backward compatibility
+export const MODELS_LEGACY = {
+  FLASH_8B: MODELS.FLASH_LITE,
+  FLASH_EXP: MODELS.FLASH,
 } as const;
 
 export type ModelType = typeof MODELS[keyof typeof MODELS];
 
 // Alias exports for backward compatibility with governance modules
-export const gemini15Flash = gemini20Flash; // Map old name to new model
-export { gemini15Pro };
+export const gemini15Flash = MODELS.FLASH;
+export const gemini15Pro = MODELS.PRO;
+export const gemini20Flash = MODELS.FLASH;
+export const gemini20FlashExp = MODELS.FLASH;

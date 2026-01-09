@@ -271,7 +271,7 @@ export function BoltFileExplorer({ onFileSelect, selectedPath }: BoltFileExplore
       </div>
 
       {/* Tree */}
-      <div className="flex-1 overflow-auto py-2">
+      <div className="flex-1 overflow-y-auto overflow-x-hidden scrollbar-thin py-2">
         {tree.length === 0 && !isLoading ? (
           <div className="px-3 py-8 text-center text-zinc-600 text-sm">
             No files found

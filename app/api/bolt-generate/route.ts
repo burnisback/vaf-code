@@ -4,6 +4,11 @@
  * Unified generator endpoint that streams AI responses as SSE.
  * Parses vafArtifact/vafAction tags and emits structured actions.
  *
+ * Supports intelligent routing based on request classification:
+ * - question: Direct answers without code generation
+ * - simple/moderate: Standard code generation with flash model
+ * - complex/mega-complex: Advanced generation with pro model
+ *
  * POST /api/bolt-generate
  *
  * Request body:
@@ -13,9 +18,17 @@
  *     fileTree: string;
  *     framework: string;
  *     styling: string;
+ *     language?: {
+ *       primary: 'typescript' | 'javascript';
+ *       hasTypeScript: boolean;
+ *       hasJavaScript: boolean;
+ *       hasTsConfig: boolean;
+ *       fileExtensions: { components: '.tsx' | '.jsx'; modules: '.ts' | '.js' };
+ *     };
  *     existingFiles?: { path: string; content: string }[];
  *   };
  *   conversationHistory?: { role: string; content: string }[];
+ *   classification?: ClassificationResult;
  * }
  *
  * SSE Response events:
@@ -29,6 +42,26 @@ import { ai, MODELS } from '@/lib/ai/genkit';
 import { BOLT_SYSTEM_PROMPT, buildContextualPrompt } from '@/lib/bolt/ai/prompts';
 import { parseArtifacts } from '@/lib/bolt/ai/parser';
 import type { BoltGenerateRequest, BoltStreamChunk } from '@/lib/bolt/types';
+import type { ClassificationResult } from '@/lib/bolt/ai/classifier';
+
+// Question mode system prompt - comprehensive project-aware answering
+const QUESTION_SYSTEM_PROMPT = `You are an expert AI assistant with deep knowledge of the user's web development project.
+
+You have access to the project's complete file structure, key source files, and conversation history.
+Use this information to provide comprehensive, project-specific answers.
+
+When answering questions about this project:
+1. **Reference specific files, functions, and code patterns** from the project context
+2. **Explain BOTH the technical implementation AND the product functionality**
+3. **Be specific** - mention actual component names, routes, APIs, hooks, and features you see in the code
+4. **If asked about functionality**, describe what the application DOES, not just its tech stack
+5. **Structure your answer** clearly with sections if the question is broad
+6. **Quote relevant code snippets** when they help explain your answer
+
+Do NOT generate code blocks with vafArtifact or vafAction tags - focus on explaining.
+
+If the user is actually asking you to build or modify something (not just asking a question),
+let them know you'd be happy to help with that as a separate request.`;
 
 // Force dynamic rendering for streaming
 export const dynamic = 'force-dynamic';
@@ -43,8 +76,8 @@ export const maxDuration = 60;
 export async function POST(request: Request) {
   try {
     // Parse request body
-    const body = await request.json() as BoltGenerateRequest;
-    const { prompt, projectContext, conversationHistory } = body;
+    const body = await request.json() as BoltGenerateRequest & { classification?: ClassificationResult };
+    const { prompt, projectContext, conversationHistory, classification } = body;
 
     // Validate request
     if (!prompt || typeof prompt !== 'string') {
@@ -54,15 +87,96 @@ export async function POST(request: Request) {
       );
     }
 
+    // Determine mode from classification (default to 'moderate' if not provided)
+    const mode = classification?.mode || 'moderate';
+    const isQuestionMode = mode === 'question';
+
+    console.log('[bolt-generate] Request classification:', {
+      mode,
+      confidence: classification?.confidence,
+      domains: classification?.domains,
+    });
+
     // Build the full prompt with context
-    const contextualPrompt = buildContextualPrompt(
-      prompt,
-      projectContext || { fileTree: '', framework: 'React + Vite', styling: 'Tailwind CSS' },
-      conversationHistory?.map(m => ({
-        role: m.role as 'user' | 'assistant',
-        content: m.content,
-      }))
-    );
+    const languageInfo = projectContext?.language?.primary === 'typescript'
+      ? 'TypeScript (use .tsx for React components, .ts for other files)'
+      : 'JavaScript (use .jsx for React components, .js for other files)';
+
+    // For question mode, build comprehensive context prompt
+    let contextualPrompt: string;
+
+    if (isQuestionMode) {
+      // Build comprehensive context for questions
+      const contextParts: string[] = [];
+
+      // Project overview
+      contextParts.push(`<project_context>
+Language: ${languageInfo}
+Framework: ${projectContext?.framework || 'React + Vite'}
+Styling: ${projectContext?.styling || 'Tailwind CSS'}
+</project_context>`);
+
+      // File tree structure - CRITICAL for understanding project layout
+      if (projectContext?.fileTree) {
+        contextParts.push(`<file_structure>
+${projectContext.fileTree}
+</file_structure>`);
+      }
+
+      // Existing/relevant files - CRITICAL for understanding implementation
+      if (projectContext?.existingFiles && projectContext.existingFiles.length > 0) {
+        const fileContents = projectContext.existingFiles
+          .map(f => {
+            // Truncate very long files
+            const content = f.content.length > 4000
+              ? f.content.slice(0, 4000) + '\n... (truncated)'
+              : f.content;
+            return `### ${f.path}\n\`\`\`\n${content}\n\`\`\``;
+          })
+          .join('\n\n');
+        contextParts.push(`<key_files>
+The following are important source files in the project. Use these to understand the codebase:
+
+${fileContents}
+</key_files>`);
+      }
+
+      // Conversation history for context continuity
+      if (conversationHistory && conversationHistory.length > 0) {
+        const historyText = conversationHistory
+          .slice(-6) // Last 6 messages
+          .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.length > 500 ? m.content.slice(0, 500) + '...' : m.content}`)
+          .join('\n\n');
+        contextParts.push(`<conversation_history>
+${historyText}
+</conversation_history>`);
+      }
+
+      // User question
+      contextParts.push(`<user_question>
+${prompt}
+</user_question>`);
+
+      contextualPrompt = contextParts.join('\n\n');
+    } else {
+      // For code generation, use the standard builder
+      contextualPrompt = buildContextualPrompt(
+        prompt,
+        projectContext || { fileTree: '', framework: 'React + Vite', styling: 'Tailwind CSS' },
+        conversationHistory?.map(m => ({
+          role: m.role as 'user' | 'assistant',
+          content: m.content,
+        }))
+      );
+    }
+
+    // Select system prompt based on mode
+    const systemPrompt = isQuestionMode ? QUESTION_SYSTEM_PROMPT : BOLT_SYSTEM_PROMPT;
+
+    // Select model based on mode (pro for complex, flash for others)
+    const selectedModel = (mode === 'complex' || mode === 'mega-complex')
+      ? MODELS.PRO
+      : MODELS.FLASH;
 
     // Create SSE stream
     const encoder = new TextEncoder();
@@ -101,16 +215,19 @@ export async function POST(request: Request) {
         });
 
         try {
-          // Generate with streaming
+          // Generate with streaming using mode-appropriate settings
           const { stream: aiStream } = await ai.generateStream({
-            model: MODELS.FLASH,
-            system: BOLT_SYSTEM_PROMPT,
+            model: selectedModel,
+            system: systemPrompt,
             prompt: contextualPrompt,
             config: {
-              temperature: 0.4,
-              maxOutputTokens: 8192,
+              temperature: isQuestionMode ? 0.3 : 0.4,
+              // Increased from 2048 to 4096 for questions to allow comprehensive answers
+              maxOutputTokens: isQuestionMode ? 4096 : 8192,
             },
           });
+
+          console.log(`[bolt-generate] Using model: ${selectedModel === MODELS.PRO ? 'PRO' : 'FLASH'}, mode: ${mode}`);
 
           let fullResponse = '';
 
@@ -136,22 +253,25 @@ export async function POST(request: Request) {
 
           // Only continue if client is still connected
           if (!isClosed && !request.signal.aborted) {
-            // After streaming completes, parse artifacts and emit actions
-            const artifacts = parseArtifacts(fullResponse);
+            // For question mode, skip artifact parsing (no code actions expected)
+            if (!isQuestionMode) {
+              // After streaming completes, parse artifacts and emit actions
+              const artifacts = parseArtifacts(fullResponse);
 
-            for (const artifact of artifacts) {
-              for (const action of artifact.actions) {
-                if (isClosed) break;
+              for (const artifact of artifacts) {
+                for (const action of artifact.actions) {
+                  if (isClosed) break;
 
-                const actionEvent: BoltStreamChunk = {
-                  type: 'action',
-                  action: {
-                    type: action.type,
-                    filePath: action.filePath,
-                    content: action.content,
-                  },
-                };
-                safeEnqueue(controller, `data: ${JSON.stringify(actionEvent)}\n\n`);
+                  const actionEvent: BoltStreamChunk = {
+                    type: 'action',
+                    action: {
+                      type: action.type,
+                      filePath: action.filePath,
+                      content: action.content,
+                    },
+                  };
+                  safeEnqueue(controller, `data: ${JSON.stringify(actionEvent)}\n\n`);
+                }
               }
             }
 

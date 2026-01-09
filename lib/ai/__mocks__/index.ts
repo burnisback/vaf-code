@@ -24,7 +24,9 @@ export {
 export {
   googleAI,
   gemini15Flash,
-  gemini15Flash8b,
   gemini15Pro,
+  gemini20Flash,
   gemini20FlashExp,
+  gemini25Flash,
+  gemini25Pro,
 } from './googleai';

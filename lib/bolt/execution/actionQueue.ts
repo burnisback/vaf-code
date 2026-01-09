@@ -52,6 +52,111 @@ export interface ActionQueueCallbacks {
   onProgress?: (message: string) => void;
   onFilesystemChange?: () => void;
   onTerminalOutput?: (data: string) => void;
+
+  // Phase 3: Per-file verification callbacks
+  /** Called after a file is written - return false to trigger rollback */
+  onFileVerify?: (filePath: string) => Promise<{ valid: boolean; errors: string[] }>;
+  /** Called when auto-rollback is triggered */
+  onAutoRollback?: (filePath: string, reason: string) => void;
+}
+
+export interface ActionQueueConfig {
+  /** Enable per-file verification after writes (Phase 3) */
+  enablePerFileVerify: boolean;
+  /** Auto-rollback on verification failure (Phase 3) */
+  autoRollbackOnFailure: boolean;
+  /** Maximum history size */
+  maxHistorySize: number;
+}
+
+const DEFAULT_QUEUE_CONFIG: ActionQueueConfig = {
+  enablePerFileVerify: false, // Off by default, enable via configuration
+  autoRollbackOnFailure: true,
+  maxHistorySize: 50,
+};
+
+// =============================================================================
+// DANGEROUS COMMAND DETECTION (Phase 2)
+// =============================================================================
+
+/**
+ * Patterns that indicate dangerous/destructive commands
+ */
+const DANGEROUS_PATTERNS = [
+  // File deletion
+  /\brm\s+(-rf?|--recursive|--force)?\s*[^\s|&;]+/i,
+  /\brmdir\s+/i,
+  /\bdel\s+/i,
+  // Directory operations that could be destructive
+  /\bmv\s+.*\s+\/dev\/null/i,
+  // Git destructive operations
+  /\bgit\s+(push\s+--force|reset\s+--hard|clean\s+-fd)/i,
+];
+
+/**
+ * Check if a shell command is dangerous/destructive
+ */
+export function isDangerousCommand(command: string): { dangerous: boolean; reason?: string } {
+  const normalized = command.trim().toLowerCase();
+
+  for (const pattern of DANGEROUS_PATTERNS) {
+    if (pattern.test(normalized)) {
+      // Determine specific reason
+      if (/\brm\s/.test(normalized)) {
+        return {
+          dangerous: true,
+          reason: 'rm command bypasses file tracking and rollback. Use delete action type instead.',
+        };
+      }
+      if (/\brmdir\s/.test(normalized) || /\bdel\s/.test(normalized)) {
+        return {
+          dangerous: true,
+          reason: 'Directory deletion command detected. Use tracked delete operations.',
+        };
+      }
+      if (/\bgit\s+push\s+--force/.test(normalized)) {
+        return {
+          dangerous: true,
+          reason: 'Force push can destroy remote history. Manual confirmation required.',
+        };
+      }
+      if (/\bgit\s+reset\s+--hard/.test(normalized)) {
+        return {
+          dangerous: true,
+          reason: 'Hard reset can lose uncommitted changes.',
+        };
+      }
+      return { dangerous: true, reason: 'Potentially destructive operation.' };
+    }
+  }
+
+  return { dangerous: false };
+}
+
+/**
+ * Extract file paths from rm commands for conversion to delete actions
+ */
+export function extractRmPaths(command: string): string[] {
+  // Match: rm [-rf] path1 path2 ...
+  const match = command.match(/\brm\s+(?:-[rfRF]+\s+)?(.+)/);
+  if (!match) return [];
+
+  // Split paths, handling quotes
+  const pathsPart = match[1];
+  const paths: string[] = [];
+
+  // Simple split - could be improved for quoted paths
+  const tokens = pathsPart.split(/\s+/).filter(t => !t.startsWith('-'));
+
+  for (const token of tokens) {
+    // Remove quotes
+    const cleaned = token.replace(/^["']|["']$/g, '').trim();
+    if (cleaned) {
+      paths.push(cleaned);
+    }
+  }
+
+  return paths;
 }
 
 // =============================================================================
@@ -116,12 +221,34 @@ export class ActionQueue {
 
   private webcontainer: WebContainer | null = null;
   private callbacks: ActionQueueCallbacks = {};
+  private config: ActionQueueConfig;
   private isProcessing = false;
-  private maxHistorySize = 50;
 
-  constructor(webcontainer: WebContainer | null, callbacks?: ActionQueueCallbacks) {
+  // Phase 3: Track files modified in current batch for potential rollback
+  private currentBatchFiles: string[] = [];
+
+  constructor(
+    webcontainer: WebContainer | null,
+    callbacks?: ActionQueueCallbacks,
+    config?: Partial<ActionQueueConfig>
+  ) {
     this.webcontainer = webcontainer;
     this.callbacks = callbacks || {};
+    this.config = { ...DEFAULT_QUEUE_CONFIG, ...config };
+  }
+
+  /**
+   * Update configuration
+   */
+  setConfig(config: Partial<ActionQueueConfig>): void {
+    this.config = { ...this.config, ...config };
+  }
+
+  /**
+   * Enable Phase 3 per-file verification
+   */
+  enablePerFileVerification(enabled: boolean = true): void {
+    this.config.enablePerFileVerify = enabled;
   }
 
   /**
@@ -225,6 +352,8 @@ export class ActionQueue {
 
     if (action.type === 'file' && action.filePath) {
       return this.executeFileAction(action);
+    } else if (action.type === 'delete' && action.filePath) {
+      return this.executeDeleteAction(action);
     } else if (action.type === 'shell') {
       return this.executeShellAction(action);
     }
@@ -237,7 +366,76 @@ export class ActionQueue {
   }
 
   /**
+   * Execute a delete action with backup and reference checking
+   * Phase 2: Safe file deletion with tracking
+   */
+  private async executeDeleteAction(action: QueuedAction): Promise<BoltExecutionResult> {
+    const { filePath } = action;
+    if (!filePath || !this.webcontainer) {
+      return { type: 'delete', success: false, error: 'Invalid delete action' };
+    }
+
+    try {
+      // Check if file exists
+      let existingContent: string | null = null;
+      try {
+        existingContent = await this.webcontainer.fs.readFile(filePath, 'utf-8');
+      } catch {
+        // File doesn't exist - nothing to delete
+        this.callbacks.onTerminalOutput?.(
+          `\x1b[33m[Bolt] File ${filePath} does not exist, skipping delete\x1b[0m\r\n`
+        );
+        return {
+          type: 'delete',
+          path: filePath,
+          success: true, // Success - nothing to do
+        };
+      }
+
+      // Create backup before deletion
+      action.backup = {
+        path: filePath,
+        content: existingContent,
+        createdAt: Date.now(),
+      };
+
+      this.callbacks.onProgress?.(`Deleting ${filePath}...`);
+      this.callbacks.onTerminalOutput?.(
+        `\x1b[33m[Bolt] Deleting ${filePath}...\x1b[0m\r\n`
+      );
+
+      // Perform the deletion
+      await this.webcontainer.fs.rm(filePath);
+
+      this.callbacks.onTerminalOutput?.(
+        `\x1b[32m[Bolt] ✓ Deleted ${filePath} (backup saved for rollback)\x1b[0m\r\n`
+      );
+
+      this.callbacks.onFilesystemChange?.();
+
+      return {
+        type: 'delete',
+        path: filePath,
+        success: true,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      this.callbacks.onTerminalOutput?.(
+        `\x1b[31m[Bolt] ✗ Failed to delete ${filePath}: ${message}\x1b[0m\r\n`
+      );
+
+      return {
+        type: 'delete',
+        path: filePath,
+        success: false,
+        error: message,
+      };
+    }
+  }
+
+  /**
    * Execute a file action with backup
+   * Phase 3: Now includes optional per-file verification after write
    */
   private async executeFileAction(action: QueuedAction): Promise<BoltExecutionResult> {
     const { filePath, content } = action;
@@ -282,6 +480,56 @@ export class ActionQueue {
         `(+${diff.added} -${diff.removed})\x1b[0m\r\n`
       );
 
+      // Track file for potential batch rollback
+      this.currentBatchFiles.push(filePath);
+
+      // Phase 3: Per-file verification after write
+      if (this.config.enablePerFileVerify && this.callbacks.onFileVerify) {
+        this.callbacks.onTerminalOutput?.(
+          `\x1b[36m[Bolt] Verifying ${filePath}...\x1b[0m\r\n`
+        );
+
+        const verifyResult = await this.callbacks.onFileVerify(filePath);
+
+        if (!verifyResult.valid) {
+          // Verification failed - optionally auto-rollback
+          this.callbacks.onTerminalOutput?.(
+            `\x1b[31m[Bolt] ✗ Verification failed for ${filePath}\x1b[0m\r\n`
+          );
+
+          for (const error of verifyResult.errors.slice(0, 3)) {
+            this.callbacks.onTerminalOutput?.(
+              `\x1b[31m[Bolt]   - ${error}\x1b[0m\r\n`
+            );
+          }
+
+          if (this.config.autoRollbackOnFailure) {
+            // Rollback this file immediately
+            this.callbacks.onTerminalOutput?.(
+              `\x1b[33m[Bolt] ↩ Auto-rolling back ${filePath}...\x1b[0m\r\n`
+            );
+
+            await this.rollbackSingleFile(action);
+
+            this.callbacks.onAutoRollback?.(
+              filePath,
+              `Verification failed: ${verifyResult.errors.join(', ')}`
+            );
+
+            return {
+              type: 'file',
+              path: filePath,
+              success: false,
+              error: `Verification failed (auto-rolled back): ${verifyResult.errors.join(', ')}`,
+            };
+          }
+        } else {
+          this.callbacks.onTerminalOutput?.(
+            `\x1b[32m[Bolt] ✓ ${filePath} verified\x1b[0m\r\n`
+          );
+        }
+      }
+
       this.callbacks.onFilesystemChange?.();
 
       return {
@@ -305,7 +553,47 @@ export class ActionQueue {
   }
 
   /**
+   * Phase 3: Rollback a single file from its backup
+   */
+  private async rollbackSingleFile(action: QueuedAction): Promise<boolean> {
+    if (!action.backup || !this.webcontainer) {
+      return false;
+    }
+
+    try {
+      const { backup } = action;
+
+      if (backup.content === null) {
+        // File didn't exist before - delete it
+        await this.webcontainer.fs.rm(backup.path);
+      } else {
+        // Restore previous content
+        await this.webcontainer.fs.writeFile(backup.path, backup.content);
+      }
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Phase 3: Get files modified in current batch
+   */
+  getCurrentBatchFiles(): string[] {
+    return [...this.currentBatchFiles];
+  }
+
+  /**
+   * Phase 3: Clear current batch tracking
+   */
+  clearCurrentBatch(): void {
+    this.currentBatchFiles = [];
+  }
+
+  /**
    * Execute a shell action with enhanced progress
+   * Phase 2: Includes dangerous command detection
    */
   private async executeShellAction(action: QueuedAction): Promise<BoltExecutionResult> {
     if (!this.webcontainer) {
@@ -313,6 +601,73 @@ export class ActionQueue {
     }
 
     const command = action.content.trim();
+
+    // Phase 2 + Fix: Convert rm commands to delete actions instead of blocking
+    if (/\brm\s/.test(command.toLowerCase())) {
+      const paths = extractRmPaths(command);
+      if (paths.length > 0) {
+        this.callbacks.onTerminalOutput?.(
+          `\x1b[33m[Bolt] Converting rm command to tracked delete operations...\x1b[0m\r\n`
+        );
+
+        // Execute delete actions for each path
+        let allSuccess = true;
+        const errors: string[] = [];
+
+        for (const filePath of paths) {
+          const deleteAction: QueuedAction = {
+            id: generateActionId(),
+            type: 'delete',
+            filePath,
+            content: '',
+            status: 'pending',
+            queuedAt: Date.now(),
+          };
+
+          const result = await this.executeDeleteAction(deleteAction);
+          if (!result.success) {
+            allSuccess = false;
+            errors.push(result.error || `Failed to delete ${filePath}`);
+          }
+        }
+
+        if (allSuccess) {
+          return {
+            type: 'shell',
+            command,
+            success: true,
+            exitCode: 0,
+          };
+        } else {
+          return {
+            type: 'shell',
+            command,
+            success: false,
+            error: `Some deletions failed: ${errors.join(', ')}`,
+          };
+        }
+      }
+    }
+
+    // Phase 2: Check for other dangerous commands (not rm)
+    const dangerCheck = isDangerousCommand(command);
+    if (dangerCheck.dangerous && !/\brm\s/.test(command.toLowerCase())) {
+      const blockedMsg = `BLOCKED: ${dangerCheck.reason}`;
+
+      this.callbacks.onTerminalOutput?.(
+        `\x1b[31m[Bolt] ⛔ Command blocked: ${command}\x1b[0m\r\n`
+      );
+      this.callbacks.onTerminalOutput?.(
+        `\x1b[31m[Bolt] Reason: ${dangerCheck.reason}\x1b[0m\r\n`
+      );
+
+      return {
+        type: 'shell',
+        command,
+        success: false,
+        error: blockedMsg,
+      };
+    }
 
     try {
       this.callbacks.onProgress?.(`Running: ${command}...`);
@@ -395,8 +750,8 @@ export class ActionQueue {
     this.state.history.unshift(entry);
 
     // Trim history
-    if (this.state.history.length > this.maxHistorySize) {
-      this.state.history = this.state.history.slice(0, this.maxHistorySize);
+    if (this.state.history.length > this.config.maxHistorySize) {
+      this.state.history = this.state.history.slice(0, this.config.maxHistorySize);
     }
   }
 

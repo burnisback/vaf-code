@@ -5,6 +5,10 @@
  */
 
 import type { BoltTemplate } from '../types';
+import {
+  ERROR_HANDLER_SCRIPT,
+  REACT_ERROR_BOUNDARY_SOURCE,
+} from '../debug/error-handler';
 
 /**
  * React + Vite + Tailwind Template
@@ -100,6 +104,10 @@ export default {
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Bolt Project</title>
+    <!-- VAF Error Handler - Must load before app -->
+    <script>
+${ERROR_HANDLER_SCRIPT}
+    </script>
   </head>
   <body>
     <div id="root"></div>
@@ -116,14 +124,22 @@ export default {
             contents: `import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
+import VAFErrorBoundary from './VAFErrorBoundary';
 import './index.css';
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    <App />
+    <VAFErrorBoundary>
+      <App />
+    </VAFErrorBoundary>
   </React.StrictMode>
 );
 `,
+          },
+        },
+        'VAFErrorBoundary.jsx': {
+          file: {
+            contents: REACT_ERROR_BOUNDARY_SOURCE,
           },
         },
         'App.jsx': {

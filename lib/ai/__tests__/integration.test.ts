@@ -23,10 +23,10 @@ vi.mock('genkit', () => ({
   },
 }));
 
-vi.mock('@genkit-ai/googleai', () => ({
-  googleAI: vi.fn(() => ({})),
-  gemini15Flash: { name: 'gemini-1.5-flash' },
-  gemini15Pro: { name: 'gemini-1.5-pro' },
+vi.mock('@genkit-ai/google-genai', () => ({
+  googleAI: Object.assign(vi.fn(() => ({})), {
+    model: vi.fn((name: string) => ({ name, __mock: true })),
+  }),
 }));
 
 // Import after mocks

@@ -105,12 +105,56 @@ export interface ProjectContext {
   fileTree: string;
   framework: string;
   styling: string;
+  language?: {
+    primary: 'typescript' | 'javascript';
+    hasTypeScript: boolean;
+    hasJavaScript: boolean;
+    hasTsConfig: boolean;
+    fileExtensions: {
+      components: '.tsx' | '.jsx';
+      modules: '.ts' | '.js';
+    };
+  };
   existingFiles?: { path: string; content: string }[];
 }
 
 export interface ConversationMessage {
   role: 'user' | 'assistant';
   content: string;
+}
+
+/**
+ * Get language-specific rules for the AI
+ */
+function getLanguageRulesText(language: ProjectContext['language']): string {
+  if (!language || language.primary === 'javascript') {
+    return `
+Language: JavaScript
+- Use .jsx extension for React components
+- Use .js extension for other JavaScript files
+`;
+  }
+
+  return `
+Language: TypeScript
+
+CRITICAL FILE EXTENSION RULES:
+==============================
+This is a TypeScript project. You MUST follow these rules:
+
+1. React components: ALWAYS use .tsx extension
+   ✓ Button.tsx, Header.tsx, App.tsx, NewComponent.tsx
+   ✗ Button.jsx, Header.jsx, App.jsx (NEVER use .jsx)
+
+2. Non-React TypeScript: ALWAYS use .ts extension
+   ✓ utils.ts, types.ts, hooks/useAuth.ts
+   ✗ utils.js, types.js (NEVER use .js)
+
+3. NEVER create .jsx or .js files in this TypeScript project
+   Exception: Config files like vite.config.js, tailwind.config.js are OK
+
+4. Always include TypeScript types for function parameters and return values
+`;
 }
 
 /**
@@ -123,8 +167,12 @@ export function buildContextualPrompt(
 ): string {
   const parts: string[] = [];
 
-  // Project context
+  // Language rules (CRITICAL - placed first for emphasis)
+  const languageRules = getLanguageRulesText(context.language);
+
+  // Project context with language info prominently displayed
   parts.push(`<project_context>
+${languageRules}
 Framework: ${context.framework}
 Styling: ${context.styling}
 

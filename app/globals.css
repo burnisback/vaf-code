@@ -88,6 +88,56 @@
   }
 }
 
+/* Chat UI Animations */
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+@keyframes scale-in {
+  from {
+    transform: scale(0);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pulse-glow {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(139, 92, 246, 0);
+  }
+  50% {
+    box-shadow: 0 0 12px 4px rgba(139, 92, 246, 0.3);
+  }
+}
+
+@keyframes typing-cursor {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
 @layer base {
   html {
     scroll-behavior: smooth;
@@ -120,6 +170,98 @@
 
   .animate-accordion-up {
     animation: accordion-up 0.2s ease-out;
+  }
+
+  /* Chat UI Animation Utilities */
+  .animate-shimmer {
+    background: linear-gradient(90deg, transparent, rgba(139, 92, 246, 0.1), transparent);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+  }
+
+  .animate-scale-in {
+    animation: scale-in 0.2s ease-out;
+  }
+
+  .animate-fade-in {
+    animation: fade-in 0.3s ease-out;
+  }
+
+  .animate-pulse-glow {
+    animation: pulse-glow 2s infinite;
+  }
+
+  .animate-typing-cursor {
+    animation: typing-cursor 1s infinite;
+  }
+
+  /* =========================================================================
+   * Custom Scrollbar Utilities
+   * Sleek, minimal scrollbars for the dark IDE theme
+   * ========================================================================= */
+
+  /* Completely hidden scrollbar - still scrollable */
+  .scrollbar-none {
+    -ms-overflow-style: none;  /* IE and Edge */
+    scrollbar-width: none;  /* Firefox */
+  }
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;  /* Chrome, Safari, Opera */
+  }
+
+  /* Thin, subtle scrollbar - visible but minimal */
+  .scrollbar-thin {
+    scrollbar-width: thin;  /* Firefox */
+    scrollbar-color: rgba(113, 113, 122, 0.3) transparent;  /* Firefox: thumb track */
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: rgba(113, 113, 122, 0.3);
+    border-radius: 3px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    background: rgba(113, 113, 122, 0.5);
+  }
+  .scrollbar-thin::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  /* Auto-hide scrollbar - appears on hover */
+  .scrollbar-auto-hide {
+    scrollbar-width: thin;
+    scrollbar-color: transparent transparent;
+  }
+  .scrollbar-auto-hide::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .scrollbar-auto-hide::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .scrollbar-auto-hide::-webkit-scrollbar-thumb {
+    background: transparent;
+    border-radius: 3px;
+    transition: background 0.2s ease;
+  }
+  .scrollbar-auto-hide:hover::-webkit-scrollbar-thumb {
+    background: rgba(113, 113, 122, 0.4);
+  }
+  .scrollbar-auto-hide:hover {
+    scrollbar-color: rgba(113, 113, 122, 0.4) transparent;
+  }
+  .scrollbar-auto-hide::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  /* Gutter - adds space for scrollbar without shifting content */
+  .scrollbar-gutter-stable {
+    scrollbar-gutter: stable;
   }
 }
 

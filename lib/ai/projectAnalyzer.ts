@@ -390,7 +390,7 @@ function detectTechnologyStack(
   if (allDeps['turbo']) stack.buildTools.push('Turborepo');
 
   // Other notable dependencies
-  if (allDeps['genkit'] || allDeps['@genkit-ai/googleai']) stack.other.push('Genkit AI');
+  if (allDeps['genkit'] || allDeps['@genkit-ai/googleai'] || allDeps['@genkit-ai/google-genai']) stack.other.push('Genkit AI');
   if (allDeps['prisma'] || allDeps['@prisma/client']) stack.other.push('Prisma');
   if (allDeps['trpc'] || allDeps['@trpc/server']) stack.other.push('tRPC');
   if (allDeps['graphql']) stack.other.push('GraphQL');

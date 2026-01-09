@@ -93,11 +93,12 @@ function useDebouncedCallback<T extends (...args: any[]) => void>(
 interface EditorTabProps {
   file: BoltOpenFile;
   isActive: boolean;
+  isSaving?: boolean;
   onClick: () => void;
   onClose: () => void;
 }
 
-const EditorTab = memo(function EditorTab({ file, isActive, onClick, onClose }: EditorTabProps) {
+const EditorTab = memo(function EditorTab({ file, isActive, isSaving, onClick, onClose }: EditorTabProps) {
   return (
     <div
       className={`group flex items-center gap-2 px-3 py-1.5 text-[13px] cursor-pointer border-r border-zinc-800/50 transition-colors ${
@@ -108,9 +109,12 @@ const EditorTab = memo(function EditorTab({ file, isActive, onClick, onClose }: 
       onClick={onClick}
     >
       <span className="truncate max-w-[100px]">{file.name}</span>
-      {file.isDirty && (
-        <span className="w-2 h-2 rounded-full bg-violet-500 flex-shrink-0" />
-      )}
+      {/* Show saving indicator OR dirty indicator */}
+      {isSaving ? (
+        <Loader2 className="w-3 h-3 animate-spin text-violet-400 flex-shrink-0" />
+      ) : file.isDirty ? (
+        <span className="w-2 h-2 rounded-full bg-violet-500 flex-shrink-0" title="Unsaved changes" />
+      ) : null}
       <button
         onClick={(e) => {
           e.stopPropagation();
@@ -135,6 +139,8 @@ interface BoltCodeEditorProps {
   onFileClose: (path: string) => void;
   onFileSelect: (path: string) => void;
   onFileSave: (path: string) => void;
+  /** Auto-save delay in ms (0 to disable). Default: 1500ms */
+  autoSaveDelay?: number;
 }
 
 export function BoltCodeEditor({
@@ -144,34 +150,91 @@ export function BoltCodeEditor({
   onFileClose,
   onFileSelect,
   onFileSave,
+  autoSaveDelay = 1500,
 }: BoltCodeEditorProps) {
   const { webcontainer, isReady } = useBoltWebContainer();
   const [content, setContent] = useState<string>('');
   const [isLoading, setIsLoading] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const editorRef = useRef<any>(null);
+  const autoSaveTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Refs for stable callback access
   const activeFileRef = useRef(activeFile);
   const contentRef = useRef(content);
   const onFileSaveRef = useRef(onFileSave);
   const onFileChangeRef = useRef(onFileChange);
+  const openFilesRef = useRef(openFiles);
 
   useEffect(() => { activeFileRef.current = activeFile; }, [activeFile]);
   useEffect(() => { contentRef.current = content; }, [content]);
   useEffect(() => { onFileSaveRef.current = onFileSave; }, [onFileSave]);
   useEffect(() => { onFileChangeRef.current = onFileChange; }, [onFileChange]);
+  useEffect(() => { openFilesRef.current = openFiles; }, [openFiles]);
 
-  // Debounced change handler
+  // Cleanup auto-save timer on unmount
+  useEffect(() => {
+    return () => {
+      if (autoSaveTimerRef.current) {
+        clearTimeout(autoSaveTimerRef.current);
+      }
+    };
+  }, []);
+
+  // Debounced change handler - updates parent state
   const debouncedFileChange = useDebouncedCallback(
     (path: string, newContent: string) => onFileChangeRef.current(path, newContent),
     300
   );
 
-  // Load file content
+  // Auto-save function - writes to WebContainer and triggers parent save
+  const triggerAutoSave = useCallback(async (path: string, newContent: string) => {
+    if (!webcontainer || !isReady || autoSaveDelay === 0) return;
+
+    // Clear any pending auto-save
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+    }
+
+    // Schedule auto-save
+    autoSaveTimerRef.current = setTimeout(async () => {
+      try {
+        setIsSaving(true);
+        await webcontainer.fs.writeFile(path, newContent);
+        // Trigger parent's save callback to clear dirty flag
+        onFileSaveRef.current(path);
+        console.log('[BoltCodeEditor] Auto-saved:', path);
+      } catch (error) {
+        console.error('[BoltCodeEditor] Auto-save error:', error);
+      } finally {
+        setIsSaving(false);
+      }
+    }, autoSaveDelay);
+  }, [webcontainer, isReady, autoSaveDelay]);
+
+  // Load file content - PRIORITIZE cached content for dirty files
   useEffect(() => {
     if (!activeFile || !webcontainer || !isReady) return;
 
+    // Clear any pending auto-save when switching files
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+
     const loadContent = async () => {
+      // Check if we have cached content for this file (preserves unsaved changes)
+      const cachedFile = openFilesRef.current.find(f => f.path === activeFile);
+
+      // Use cached content if the file is dirty (has unsaved changes)
+      if (cachedFile?.isDirty && cachedFile.content !== undefined) {
+        console.log('[BoltCodeEditor] Using cached content for dirty file:', activeFile);
+        setContent(cachedFile.content);
+        contentRef.current = cachedFile.content;
+        return;
+      }
+
+      // Otherwise, load from WebContainer
       setIsLoading(true);
       try {
         const fileContent = await webcontainer.fs.readFile(activeFile, 'utf-8');
@@ -205,14 +268,18 @@ export function BoltCodeEditor({
     editor.focus();
   }, []);
 
-  // Content change
+  // Content change - update state, notify parent, and trigger auto-save
   const handleChange: OnChange = useCallback((value) => {
     if (value !== undefined && activeFileRef.current) {
+      const path = activeFileRef.current;
       setContent(value);
       contentRef.current = value;
-      debouncedFileChange(activeFileRef.current, value);
+      // Notify parent of change (marks as dirty, caches content)
+      debouncedFileChange(path, value);
+      // Trigger auto-save
+      triggerAutoSave(path, value);
     }
-  }, [debouncedFileChange]);
+  }, [debouncedFileChange, triggerAutoSave]);
 
   // Empty state
   if (openFiles.length === 0) {
@@ -240,6 +307,7 @@ export function BoltCodeEditor({
             key={file.path}
             file={file}
             isActive={file.path === activeFile}
+            isSaving={isSaving && file.path === activeFile}
             onClick={() => onFileSelect(file.path)}
             onClose={() => onFileClose(file.path)}
           />

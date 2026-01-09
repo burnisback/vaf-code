@@ -233,211 +233,97 @@ class Orchestrator {
 
   /**
    * Generate a direct response for simple questions
+   * Enhanced to include comprehensive project context for better answers
    */
   private async generateDirectResponse(
     message: string,
     context: FullTaskContext
   ): Promise<string> {
-    const systemPrompt = `You are a helpful AI assistant for a web development project.
-Project type: ${context.project?.type || 'unknown'}
-${context.project?.fileTree ? `\nProject structure:\n${context.project.fileTree}` : ''}
+    // Build comprehensive system prompt with full project context
+    const systemPromptParts: string[] = [
+      `You are a helpful AI assistant with deep knowledge of the user's web development project.
+You have access to the project's complete structure and key files.
+Provide comprehensive, informative answers that demonstrate understanding of the codebase.`,
+    ];
 
-Answer the user's question concisely and helpfully.`;
+    // Add project type and configuration
+    if (context.project?.type && context.project.type !== 'unknown') {
+      systemPromptParts.push(`
+## PROJECT OVERVIEW
+- **Type**: ${context.project.type.toUpperCase()} project
+- **Root Path**: ${context.project.rootPath || '/'}`);
+    }
 
-    const response = await ai.generate({
-      model: MODELS.FLASH,
-      prompt: `${systemPrompt}\n\nUser: ${message}\n\nAssistant:`,
-      config: {
-        temperature: 0.7,
-        maxOutputTokens: 2048,
-      },
-    });
+    // Add file tree structure
+    if (context.project?.fileTree) {
+      systemPromptParts.push(`
+## PROJECT STRUCTURE
+\`\`\`
+${context.project.fileTree}
+\`\`\``);
+    }
 
-    return response.text || 'I apologize, but I was unable to generate a response.';
-  }
-
-  /**
-   * Run the design agent
-   */
-  private async runDesignAgent(
-    message: string,
-    context: FullTaskContext,
-    requestId: string
-  ): Promise<AgentResponse> {
-    const prompt = `You are a UI/UX design agent. Based on the user's request, create a design specification.
-
-User request: ${message}
-
-Project context:
-- Type: ${context.project?.type || 'unknown'}
-- Design system: ${JSON.stringify(context.design?.designSystem || {})}
-
-Provide a design specification that includes:
-1. Component type and variant
-2. Placement and positioning
-3. Styling classes (Tailwind)
-4. Accessibility considerations
-
-Respond in JSON format with this structure:
-{
-  "component": { "type": "...", "variant": "...", "size": "..." },
-  "placement": { "parentComponent": "...", "position": "...", "justification": "..." },
-  "styling": { "classes": [...], "reasoning": "..." },
-  "accessibility": { "ariaLabel": "...", "note": "..." }
-}`;
-
-    try {
-      const response = await ai.generate({
-        model: MODELS.FLASH,
-        prompt,
-        config: {
-          temperature: 0.3,
-          maxOutputTokens: 2048,
-        },
-      });
-
-      const text = response.text || '{}';
-      let designSpec;
-      try {
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        designSpec = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
-      } catch {
-        designSpec = {};
+    // Add key file contents - this is CRITICAL for project understanding
+    if (context.relevantFiles && context.relevantFiles.length > 0) {
+      systemPromptParts.push(`
+## KEY FILE CONTENTS
+The following are important files in the project. Use these to understand the codebase:
+`);
+      for (const file of context.relevantFiles) {
+        // Truncate very long files to avoid token overflow
+        const content = file.content.length > 3000
+          ? file.content.slice(0, 3000) + '\n... (truncated)'
+          : file.content;
+        systemPromptParts.push(`### ${file.path}
+\`\`\`
+${content}
+\`\`\`
+`);
       }
-
-      return {
-        requestId,
-        agentId: 'design' as any,
-        status: 'success',
-        output: {
-          type: 'design_spec',
-          ...designSpec,
-          component: designSpec.component || { type: 'unknown', variant: 'default', size: 'md' },
-          placement: designSpec.placement || { parentComponent: 'unknown', position: 'relative', justification: 'start' },
-          styling: designSpec.styling || { classes: [], reasoning: '' },
-        },
-        selfCheck: {
-          passed: true,
-          criteriaResults: [
-            { criterion: 'Design spec provided', met: true, evidence: 'Spec generated' },
-          ],
-          confidence: 0.8,
-        },
-      };
-    } catch (error) {
-      return {
-        requestId,
-        agentId: 'design' as any,
-        status: 'error',
-        selfCheck: {
-          passed: false,
-          criteriaResults: [],
-          confidence: 0,
-        },
-        error: {
-          code: 'DESIGN_ERROR',
-          message: error instanceof Error ? error.message : 'Design failed',
-          recoverable: true,
-        },
-      };
     }
-  }
 
-  /**
-   * Run the engineer agent
-   */
-  private async runEngineerAgent(
-    message: string,
-    context: FullTaskContext,
-    designResponse: AgentResponse,
-    requestId: string
-  ): Promise<AgentResponse> {
-    const designSpec = designResponse.output?.type === 'design_spec' ? designResponse.output : null;
-
-    const prompt = `You are a frontend engineer agent. Implement the user's request based on the design spec.
-
-User request: ${message}
-
-Design specification:
-${JSON.stringify(designSpec, null, 2)}
-
-Project context:
-- Type: ${context.project?.type || 'unknown'}
-- File tree: ${context.project?.fileTree || 'Not available'}
-
-Relevant files:
-${context.relevantFiles?.map(f => `\n### ${f.path}\n\`\`\`\n${f.content}\n\`\`\``).join('\n') || 'None'}
-
-Generate file operations to implement this feature. Respond in JSON format:
-{
-  "operations": [
-    {
-      "type": "write" | "edit",
-      "path": "path/to/file.tsx",
-      "content": "full file content for write, or omit for edit",
-      "edits": [{ "oldContent": "...", "newContent": "..." }] // for edit type
+    // Add design system context if available
+    if (context.design?.designSystem) {
+      const ds = context.design.designSystem;
+      systemPromptParts.push(`
+## DESIGN SYSTEM
+- **Colors**: Primary=${ds.colors?.primary || 'N/A'}, Secondary=${ds.colors?.secondary || 'N/A'}
+- **Font**: ${ds.typography?.fontFamily?.sans || 'system fonts'}`);
     }
-  ]
-}`;
 
-    try {
-      const response = await ai.generate({
-        model: MODELS.FLASH,
-        prompt,
-        config: {
-          temperature: 0.3,
-          maxOutputTokens: 4096,
-        },
-      });
-
-      const text = response.text || '{}';
-      let result;
-      try {
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        result = jsonMatch ? JSON.parse(jsonMatch[0]) : { operations: [] };
-      } catch {
-        result = { operations: [] };
+    // Build conversation history for context continuity
+    let conversationContext = '';
+    if (context.conversation?.messages && context.conversation.messages.length > 0) {
+      const recentMessages = context.conversation.messages.slice(-6); // Last 6 messages
+      if (recentMessages.length > 0) {
+        conversationContext = '\n## RECENT CONVERSATION\n';
+        for (const msg of recentMessages) {
+          const role = msg.role === 'user' ? 'User' : 'Assistant';
+          // Truncate long messages in history
+          const content = msg.content.length > 500
+            ? msg.content.slice(0, 500) + '...'
+            : msg.content;
+          conversationContext += `${role}: ${content}\n\n`;
+        }
       }
-
-      return {
-        requestId,
-        agentId: 'engineer' as any,
-        status: 'success',
-        output: {
-          type: 'file_operations',
-          operations: result.operations || [],
-        },
-        selfCheck: {
-          passed: true,
-          criteriaResults: [
-            { criterion: 'Implementation provided', met: true, evidence: `${result.operations?.length || 0} operations` },
-          ],
-          confidence: 0.85,
-        },
-      };
-    } catch (error) {
-      return {
-        requestId,
-        agentId: 'engineer' as any,
-        status: 'error',
-        selfCheck: {
-          passed: false,
-          criteriaResults: [],
-          confidence: 0,
-        },
-        error: {
-          code: 'ENGINEER_ERROR',
-          message: error instanceof Error ? error.message : 'Engineering failed',
-          recoverable: true,
-        },
-      };
     }
-  }
 
-  /**
-   * Run the QA agent
-   */
-  private async runQAAgent(
+    // Instructions for answering
+    systemPromptParts.push(`
+## INSTRUCTIONS
+When answering questions about this project:
+1. Reference specific files, functions, and code patterns you see in the KEY FILE CONTENTS
+2. Explain BOTH the technical implementation AND the product functionality
+3. Be specific - mention actual component names, routes, APIs, and features
+4. If asked about functionality, describe what the application DOES, not just its tech stack
+5. Structure your answer clearly with sections if the question is broad`);
+
+    const systemPrompt = systemPromptParts.join('\n');
+
+    // Build the full prompt
+    const fullPrompt = `${systemPrompt}${conversationContext}
+
+User: ${message}
     message: string,
     context: FullTaskContext,
     engineerResponse: AgentResponse,

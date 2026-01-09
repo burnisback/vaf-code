@@ -4,10 +4,16 @@
  * BoltPreview
  *
  * Professional preview panel with bolt.new styling.
+ * Includes runtime error capture from the preview iframe.
  */
 
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useImperativeHandle, forwardRef } from 'react';
 import { useBoltWebContainer } from '@/lib/bolt/webcontainer/context';
+import {
+  createRuntimeErrorCapture,
+  RuntimeErrorCapture,
+  type RuntimeError,
+} from '@/lib/bolt/execution';
 import {
   RefreshCw,
   Smartphone,
@@ -16,6 +22,7 @@ import {
   ExternalLink,
   Loader2,
   Globe,
+  AlertTriangle,
 } from 'lucide-react';
 
 // =============================================================================
@@ -23,6 +30,20 @@ import {
 // =============================================================================
 
 type ViewportSize = 'mobile' | 'tablet' | 'desktop';
+
+/** Imperative handle for BoltPreview ref */
+export interface BoltPreviewHandle {
+  /** Get the runtime error capture instance */
+  getRuntimeErrorCapture: () => RuntimeErrorCapture;
+  /** Get all captured runtime errors */
+  getRuntimeErrors: () => RuntimeError[];
+  /** Get formatted runtime errors for display/AI */
+  formatRuntimeErrors: () => string;
+  /** Clear all runtime errors */
+  clearRuntimeErrors: () => void;
+  /** Refresh the preview */
+  refresh: () => void;
+}
 
 const VIEWPORTS: Record<ViewportSize, { width: string; label: string }> = {
   mobile: { width: '375px', label: 'Mobile' },
@@ -36,14 +57,48 @@ const VIEWPORTS: Record<ViewportSize, { width: string; label: string }> = {
 
 interface BoltPreviewProps {
   className?: string;
+  /** Callback when a runtime error is captured from the preview */
+  onRuntimeError?: (error: RuntimeError) => void;
+  /** Callback when runtime errors are cleared */
+  onRuntimeErrorsClear?: () => void;
 }
 
-export function BoltPreview({ className = '' }: BoltPreviewProps) {
+export const BoltPreview = forwardRef<BoltPreviewHandle, BoltPreviewProps>(function BoltPreview({
+  className = '',
+  onRuntimeError,
+  onRuntimeErrorsClear,
+}, ref) {
   const { previewUrl, isReady, loadingState } = useBoltWebContainer();
   const [viewport, setViewport] = useState<ViewportSize>('desktop');
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [iframeLoaded, setIframeLoaded] = useState(false);
+  const [runtimeErrorCount, setRuntimeErrorCount] = useState(0);
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const errorCaptureRef = useRef(createRuntimeErrorCapture({
+    maxErrors: 50,
+    onError: (error) => {
+      setRuntimeErrorCount((prev) => prev + 1);
+      onRuntimeError?.(error);
+    },
+    onClear: () => {
+      setRuntimeErrorCount(0);
+      onRuntimeErrorsClear?.();
+    },
+  }));
+
+  // Start/stop listening for runtime errors
+  useEffect(() => {
+    const capture = errorCaptureRef.current;
+    capture.startListening();
+    return () => capture.stopListening();
+  }, []);
+
+  // Clear errors when preview URL changes (new build)
+  useEffect(() => {
+    if (previewUrl) {
+      errorCaptureRef.current.clear();
+    }
+  }, [previewUrl]);
 
   useEffect(() => {
     if (previewUrl) {
@@ -67,6 +122,15 @@ export function BoltPreview({ className = '' }: BoltPreviewProps) {
   const handleOpenExternal = useCallback(() => {
     if (previewUrl) window.open(previewUrl, '_blank');
   }, [previewUrl]);
+
+  // Expose imperative handle methods (after callbacks are defined)
+  useImperativeHandle(ref, () => ({
+    getRuntimeErrorCapture: () => errorCaptureRef.current,
+    getRuntimeErrors: () => errorCaptureRef.current.getErrors(),
+    formatRuntimeErrors: () => errorCaptureRef.current.formatErrors(),
+    clearRuntimeErrors: () => errorCaptureRef.current.clear(),
+    refresh: () => handleRefresh(),
+  }), [handleRefresh]);
 
   // Loading state
   if (!isReady || loadingState !== 'ready') {
@@ -138,6 +202,22 @@ export function BoltPreview({ className = '' }: BoltPreviewProps) {
             )}
           </div>
 
+          {/* Runtime Error Indicator */}
+          {runtimeErrorCount > 0 && (
+            <div
+              className="flex items-center gap-1.5 px-2 py-1 bg-red-500/10 border border-red-500/30 rounded-lg mr-2 cursor-pointer hover:bg-red-500/20 transition-colors"
+              title={`${runtimeErrorCount} runtime error${runtimeErrorCount > 1 ? 's' : ''} detected`}
+              onClick={() => {
+                // Could open an error panel or log errors
+                const errors = errorCaptureRef.current.getErrors();
+                console.error('[BoltPreview] Runtime errors:', errors);
+              }}
+            >
+              <AlertTriangle className="w-3.5 h-3.5 text-red-400" />
+              <span className="text-xs text-red-400 font-medium">{runtimeErrorCount}</span>
+            </div>
+          )}
+
           {/* Refresh */}
           <button
             onClick={handleRefresh}
@@ -191,4 +271,4 @@ export function BoltPreview({ className = '' }: BoltPreviewProps) {
       </div>
     </div>
   );
-}
+});

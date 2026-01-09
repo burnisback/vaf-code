@@ -20,7 +20,7 @@
  * └─────────────────────┴────────────────────────────────────────────┘
  */
 
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { BoltWebContainerProvider, useBoltWebContainer } from '@/lib/bolt/webcontainer/context';
 import { BoltFileExplorer } from './BoltFileExplorer';
 import { BoltCodeEditor } from './BoltCodeEditor';
@@ -49,11 +49,30 @@ import {
   History,
   Undo2,
   AlertTriangle,
+  Settings,
+  Ban,
+  Wrench,
 } from 'lucide-react';
 import type { BoltOpenFile, BoltChatMessage, BoltAction } from '@/lib/bolt/types';
 import { ToastProvider, useToastHelpers } from './ui/Toast';
 import { ProgressBar } from './ui/ProgressBar';
 import { UndoConfirmModal } from './ui/Modal';
+import { ClassificationBadge } from './ui/ModeBadge';
+import {
+  PlanPreview,
+  PlanPreviewSkeleton,
+  TaskProgress,
+  VerificationIndicator,
+  IterationBadge,
+  type IterationStatus,
+} from './complex';
+import { BoltConfigProvider, useBoltConfig } from '@/lib/bolt/config';
+import { BoltSettingsPanel } from './settings';
+import { EnhancedChatMessage } from '@/components/chat/EnhancedChatMessage';
+import type { ExecutionPhase, ExecutionTask } from '@/components/chat/progress/ExecutionProgress';
+import { RuntimeErrorBanner, DebugSessionPanel } from '@/components/debug';
+import { useRuntimeErrors } from '@/hooks/useRuntimeErrors';
+import type { RuntimeError } from '@/lib/bolt/types';
 
 // =============================================================================
 // TYPES
@@ -155,6 +174,7 @@ function ActionStatusIndicator({ action }: { action: BoltAction }) {
     executing: <Loader2 className="w-3 h-3 animate-spin text-violet-400" />,
     success: <Check className="w-3 h-3 text-emerald-400" />,
     error: <X className="w-3 h-3 text-red-400" />,
+    blocked: <Ban className="w-3 h-3 text-amber-400" />,
   };
 
   const typeIcon = action.type === 'file' ? (
@@ -183,49 +203,27 @@ function ActionStatusIndicator({ action }: { action: BoltAction }) {
 }
 
 // =============================================================================
-// CHAT MESSAGE COMPONENT
+// CHAT MESSAGE COMPONENT (Enhanced)
 // =============================================================================
 
-function ChatMessage({ message }: { message: BoltChatMessage }) {
-  const isUser = message.role === 'user';
-  const isStreaming = message.status === 'streaming';
-  const isError = message.status === 'error';
+interface ChatMessageProps {
+  message: BoltChatMessage;
+  executionPhase?: ExecutionPhase;
+  executionTasks?: ExecutionTask[];
+  onOpenFile?: (path: string) => void;
+}
 
+function ChatMessage({ message, executionPhase, executionTasks, onOpenFile }: ChatMessageProps) {
   return (
-    <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-3`}>
-      <div
-        className={`max-w-[90%] rounded-xl px-3 py-2 ${
-          isUser
-            ? 'bg-violet-500/20 text-violet-100'
-            : isError
-            ? 'bg-red-500/10 text-red-200 border border-red-500/20'
-            : 'bg-zinc-800/50 text-zinc-200'
-        }`}
-      >
-        {/* Message Content */}
-        <div className="text-sm whitespace-pre-wrap break-words">
-          {message.content || (isStreaming && (
-            <span className="text-zinc-500 italic">Generating...</span>
-          ))}
-        </div>
-
-        {/* Actions */}
-        {message.actions && message.actions.length > 0 && (
-          <div className="mt-2 pt-2 border-t border-zinc-700/50 flex flex-wrap gap-1">
-            {message.actions.map((action, i) => (
-              <ActionStatusIndicator key={i} action={action} />
-            ))}
-          </div>
-        )}
-
-        {/* Streaming indicator */}
-        {isStreaming && (
-          <div className="flex items-center gap-1 mt-2 text-zinc-500">
-            <Loader2 className="w-3 h-3 animate-spin" />
-            <span className="text-xs">Generating...</span>
-          </div>
-        )}
-      </div>
+    <div className="mb-3 animate-fade-in">
+      <EnhancedChatMessage
+        message={message}
+        isStreaming={message.status === 'streaming'}
+        executionPhase={executionPhase}
+        executionTasks={executionTasks}
+        onOpenFile={onOpenFile}
+        showAvatar={true}
+      />
     </div>
   );
 }
@@ -236,17 +234,45 @@ function ChatMessage({ message }: { message: BoltChatMessage }) {
 
 interface BoltChatPanelProps {
   onFilesystemChange?: () => void;
+  onOpenFile?: (path: string) => void;
 }
 
-function BoltChatPanel({ onFilesystemChange }: BoltChatPanelProps) {
+function BoltChatPanel({ onFilesystemChange, onOpenFile }: BoltChatPanelProps) {
   const { webcontainer, writeToTerminal, triggerFilesystemRefresh } = useBoltWebContainer();
+  const { config } = useBoltConfig();
   const [input, setInput] = useState('');
   const [showHistory, setShowHistory] = useState(false);
   const [showUndoConfirm, setShowUndoConfirm] = useState(false);
   const [isUndoing, setIsUndoing] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const toast = useToastHelpers();
+
+  // Runtime errors from browser console - declare BEFORE useBoltChat so we can pass the getter
+  const {
+    errors: runtimeErrors,
+    debugSession,
+    isHandlerActive,
+    hasErrors: hasRuntimeErrors,
+    startDebugSession,
+    updateDebugSession,
+    clearError: clearRuntimeError,
+    clearAllErrors: clearAllRuntimeErrors,
+    endDebugSession,
+  } = useRuntimeErrors();
+
+  // Create a stable callback to get runtime errors for verification
+  const getRuntimeErrorsCallback = useCallback(() => {
+    return runtimeErrors.map(err => ({
+      id: err.id,
+      type: err.type,
+      message: err.message,
+      stack: err.stack,
+      source: err.source,
+      line: err.line,
+    }));
+  }, [runtimeErrors]);
 
   const {
     messages,
@@ -256,6 +282,24 @@ function BoltChatPanel({ onFilesystemChange }: BoltChatPanelProps) {
     pendingActions,
     executionHistory,
     buildErrors,
+    classification,
+    // Plan-related state
+    pendingPlan,
+    planReasoning,
+    isGeneratingPlan,
+    isPlanExecuting,
+    executionProgress,
+    // Verification state
+    verificationResult,
+    isVerifying,
+    // Refinement state
+    currentIteration,
+    isRefining,
+    maxIterations,
+    canRefine,
+    // Pre-verification state (Phase 3)
+    pendingPreVerification,
+    isPreVerifying,
     sendMessage,
     clearMessages,
     retryLastMessage,
@@ -264,6 +308,14 @@ function BoltChatPanel({ onFilesystemChange }: BoltChatPanelProps) {
     retryFailedAction,
     clearBuildErrors,
     fixBuildErrors,
+    // Plan actions
+    approvePlan,
+    cancelPlan,
+    // Refinement actions
+    fixVerificationErrors,
+    // Pre-verification actions (Phase 3)
+    approveErrorFix,
+    cancelErrorFix,
   } = useBoltChat({
     webcontainer,
     onFilesystemChange: () => {
@@ -271,7 +323,138 @@ function BoltChatPanel({ onFilesystemChange }: BoltChatPanelProps) {
       onFilesystemChange?.();
     },
     onTerminalOutput: writeToTerminal,
+    config,
+    // Pass runtime error functions for verification integration
+    getRuntimeErrors: getRuntimeErrorsCallback,
+    clearRuntimeErrors: clearAllRuntimeErrors,
+    runtimeErrorCheckDelay: config.complexMode.runtimeErrorCheckDelay || 3000,
   });
+
+  // Handle auto-debug for runtime errors
+  const handleAutoDebug = useCallback(async (error: RuntimeError) => {
+    // Start the debug session
+    startDebugSession(error);
+    updateDebugSession({ status: 'analyzing' });
+
+    try {
+      // Get relevant files from the webcontainer
+      const relevantFiles: { path: string; content: string }[] = [];
+
+      // Try to read files from error source if available
+      if (error.source && webcontainer) {
+        try {
+          // Clean the path
+          const cleanPath = error.source
+            .replace(/^https?:\/\/[^/]+/, '')
+            .replace(/\?.*$/, '')
+            .replace(/^\//, '');
+
+          if (cleanPath.startsWith('src/')) {
+            const content = await webcontainer.fs.readFile(cleanPath, 'utf-8');
+            relevantFiles.push({ path: cleanPath, content });
+          }
+        } catch {
+          // File read failed, continue with empty context
+        }
+      }
+
+      // Call the debug API
+      const response = await fetch('/api/bolt-debug', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          error,
+          context: {
+            previousAttempts: debugSession?.fixAttempts || [],
+            relevantFiles,
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Debug API request failed');
+      }
+
+      const { analysis, proposedActions } = await response.json();
+
+      updateDebugSession({ status: 'fixing' });
+
+      // Execute the proposed actions via sendMessage
+      // Format the fix as a message to the AI
+      if (proposedActions.length > 0) {
+        const fixMessage = `Apply the following fix for the runtime error "${error.message.slice(0, 50)}...":\n\n${
+          proposedActions.map((a: any) =>
+            a.type === 'file'
+              ? `File: ${a.filePath}\n\`\`\`\n${a.content}\n\`\`\``
+              : `Run: ${a.content}`
+          ).join('\n\n')
+        }`;
+
+        await sendMessage(fixMessage);
+      }
+
+      // Wait for verification
+      updateDebugSession({ status: 'verifying' });
+
+      // The verification will happen automatically when errors clear or persist
+      // For now, mark as resolved after a delay
+      setTimeout(() => {
+        if (runtimeErrors.length === 0) {
+          endDebugSession(true);
+          clearAllRuntimeErrors();
+          toast.success('Error Fixed', 'The runtime error has been resolved');
+        } else {
+          // Check if this specific error is gone
+          const errorStillExists = runtimeErrors.some(
+            (e) => e.message === error.message && e.type === error.type
+          );
+          if (!errorStillExists) {
+            endDebugSession(true);
+            toast.success('Error Fixed', 'The runtime error has been resolved');
+          } else {
+            endDebugSession(false);
+            toast.error('Fix Failed', 'The error persists. Manual fix may be required.');
+          }
+        }
+      }, 3000);
+    } catch (err) {
+      console.error('[AutoDebug] Error:', err);
+      updateDebugSession({ status: 'failed' });
+      endDebugSession(false);
+      toast.error('Debug Failed', 'Could not analyze the error automatically');
+    }
+  }, [
+    webcontainer,
+    debugSession,
+    startDebugSession,
+    updateDebugSession,
+    endDebugSession,
+    clearAllRuntimeErrors,
+    runtimeErrors,
+    sendMessage,
+    toast,
+  ]);
+
+  // Compute execution phase for enhanced messages
+  const currentExecutionPhase = useMemo((): ExecutionPhase | undefined => {
+    if (isGeneratingPlan) return 'thinking';
+    if (isPlanExecuting) return 'executing';
+    if (isVerifying) return 'verifying';
+    if (verificationResult?.success) return 'complete';
+    if (verificationResult && !verificationResult.success) return 'error';
+    return undefined;
+  }, [isGeneratingPlan, isPlanExecuting, isVerifying, verificationResult]);
+
+  // Convert pending actions to execution tasks for the enhanced UI
+  const executionTasks = useMemo((): ExecutionTask[] => {
+    return pendingActions.map((action, index) => ({
+      id: `action-${index}`,
+      label: action.type === 'file' ? (action.filePath || 'File operation') : (action.content?.slice(0, 40) || 'Command'),
+      type: action.type === 'file' ? (action.operation === 'delete' ? 'delete' : action.operation === 'modify' ? 'modify' : 'file') : 'shell',
+      status: action.status === 'executing' ? 'running' : action.status || 'pending',
+      filePath: action.filePath,
+    }));
+  }, [pendingActions]);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -318,7 +501,12 @@ function BoltChatPanel({ onFilesystemChange }: BoltChatPanelProps) {
             <Zap className="w-4 h-4 text-white" />
           </div>
           <div>
-            <h2 className="font-semibold text-white text-sm">Bolt</h2>
+            <div className="flex items-center gap-2">
+              <h2 className="font-semibold text-white text-sm">Bolt</h2>
+              {config.ui.showClassificationBadge && classification && (
+                <ClassificationBadge classification={classification} size="sm" />
+              )}
+            </div>
             <p className="text-xs text-zinc-500">
               {isLoading ? loadingMessage || 'Working...' : 'AI Assistant'}
             </p>
@@ -347,12 +535,19 @@ function BoltChatPanel({ onFilesystemChange }: BoltChatPanelProps) {
               <Trash2 className="w-4 h-4" />
             </button>
           )}
+          <button
+            onClick={() => setIsSettingsOpen(true)}
+            className="p-1.5 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/50 rounded transition-colors"
+            title="Settings"
+          >
+            <Settings className="w-4 h-4" />
+          </button>
         </div>
       </div>
 
       {/* Execution History Panel */}
       {showHistory && executionHistory.length > 0 && (
-        <div className="border-b border-zinc-800/50 bg-zinc-900/50 max-h-48 overflow-auto">
+        <div className="border-b border-zinc-800/50 bg-zinc-900/50 max-h-48 overflow-y-auto overflow-x-hidden scrollbar-thin">
           <div className="flex items-center justify-between px-3 py-2 border-b border-zinc-800/30">
             <span className="text-xs font-medium text-zinc-400">
               Recent Actions ({executionHistory.filter(h => h.canRollback).length} can rollback)
@@ -433,8 +628,30 @@ function BoltChatPanel({ onFilesystemChange }: BoltChatPanelProps) {
         </div>
       )}
 
+      {/* Runtime Errors Banner */}
+      {hasRuntimeErrors && (
+        <RuntimeErrorBanner
+          errors={runtimeErrors}
+          debugSession={debugSession}
+          onStartDebug={handleAutoDebug}
+          onDismiss={clearRuntimeError}
+          onDismissAll={clearAllRuntimeErrors}
+        />
+      )}
+
+      {/* Debug Session Panel */}
+      {debugSession && debugSession.status !== 'idle' && debugSession.status !== 'resolved' && (
+        <div className="px-4 pt-3">
+          <DebugSessionPanel
+            session={debugSession}
+            onCancel={() => endDebugSession(false)}
+            onRetry={() => debugSession.currentError && handleAutoDebug(debugSession.currentError)}
+          />
+        </div>
+      )}
+
       {/* Messages Area */}
-      <div className="flex-1 overflow-auto p-4">
+      <div className="flex-1 overflow-y-auto overflow-x-hidden scrollbar-auto-hide p-4">
         {messages.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-center">
             <div className="w-16 h-16 rounded-2xl bg-zinc-800/50 flex items-center justify-center mb-4">
@@ -459,9 +676,109 @@ function BoltChatPanel({ onFilesystemChange }: BoltChatPanelProps) {
           </div>
         ) : (
           <>
-            {messages.map((message) => (
-              <ChatMessage key={message.id} message={message} />
+            {messages.map((message, index) => (
+              <ChatMessage
+                key={message.id}
+                message={message}
+                executionPhase={index === messages.length - 1 ? currentExecutionPhase : undefined}
+                executionTasks={index === messages.length - 1 ? executionTasks : undefined}
+                onOpenFile={onOpenFile}
+              />
             ))}
+
+            {/* Plan Generation Loading State */}
+            {isGeneratingPlan && (
+              <div className="mb-3">
+                <PlanPreviewSkeleton />
+              </div>
+            )}
+
+            {/* Pending Plan Awaiting Approval */}
+            {/* Only show if: plan exists, not executing, not generating, AND no verification results yet */}
+            {/* The !isVerifying && !verificationResult check prevents flash after execution completes */}
+            {pendingPlan && !isPlanExecuting && !isGeneratingPlan && !isVerifying && !verificationResult && (
+              <div className="mb-3">
+                <PlanPreview
+                  plan={pendingPlan}
+                  reasoning={planReasoning}
+                  onApprove={approvePlan}
+                  onCancel={cancelPlan}
+                  isExecuting={false}
+                />
+              </div>
+            )}
+
+            {/* Plan Executing - Show TaskProgress for real-time updates */}
+            {config.ui.showTaskProgress && pendingPlan && isPlanExecuting && executionProgress && (
+              <div className="mb-3">
+                <TaskProgress
+                  plan={pendingPlan}
+                  currentTaskId={executionProgress.currentTaskId || undefined}
+                  completedTasks={executionProgress.completedTasks}
+                  totalTasks={executionProgress.totalTasks}
+                />
+              </div>
+            )}
+
+            {/* Verification Status with Refinement (shown after plan execution) */}
+            {(isVerifying || verificationResult || isRefining) && (
+              <div className="mb-3 space-y-2">
+                {/* Iteration Badge - only show during refinement iterations */}
+                {config.ui.showIterationBadge && (currentIteration > 0 || isRefining) && (
+                  <IterationBadge
+                    iteration={currentIteration}
+                    maxIterations={maxIterations}
+                    status={
+                      isRefining
+                        ? 'refining'
+                        : isPlanExecuting
+                        ? 'executing'
+                        : verificationResult?.success
+                        ? 'success'
+                        : verificationResult
+                        ? 'failed'
+                        : 'idle'
+                    }
+                  />
+                )}
+
+                {/* Verification Indicator */}
+                <VerificationIndicator
+                  isVerifying={isVerifying}
+                  result={verificationResult ? {
+                    success: verificationResult.success,
+                    buildSuccess: verificationResult.success,
+                    typeErrors: Array(verificationResult.typeErrors).fill({ type: 'type', message: '', severity: 'error' }),
+                    moduleErrors: Array(verificationResult.moduleErrors).fill({ type: 'module', message: '', severity: 'error' }),
+                    runtimeErrors: Array(verificationResult.runtimeErrors).fill({ type: 'runtime', message: '', severity: 'error' }),
+                    lintErrors: [],
+                    timestamp: Date.now(),
+                    rawOutput: '',
+                  } : null}
+                />
+
+                {/* Fix Errors Button - only show when refinement is possible */}
+                {canRefine && (
+                  <button
+                    onClick={fixVerificationErrors}
+                    disabled={isRefining || isPlanExecuting}
+                    className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-violet-500/20 hover:bg-violet-500/30 text-violet-300 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {isRefining ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Generating Fixes...
+                      </>
+                    ) : (
+                      <>
+                        <RefreshCw className="w-4 h-4" />
+                        Fix Errors ({maxIterations - currentIteration - 1} attempt{maxIterations - currentIteration - 1 !== 1 ? 's' : ''} left)
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
+            )}
 
             {/* Pending Actions with Progress */}
             {pendingActions.length > 0 && (
@@ -479,6 +796,45 @@ function BoltChatPanel({ onFilesystemChange }: BoltChatPanelProps) {
                   {pendingActions.map((action, i) => (
                     <ActionStatusIndicator key={i} action={action} />
                   ))}
+                </div>
+              </div>
+            )}
+
+            {/* Pre-Verification Approval Panel (Phase 3) */}
+            {pendingPreVerification && !pendingPreVerification.isClean && (
+              <div className="mb-3 p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg space-y-3">
+                <div className="flex items-center gap-2 text-amber-300 text-sm font-medium">
+                  <AlertTriangle className="w-4 h-4" />
+                  {pendingPreVerification.totalErrors} Error{pendingPreVerification.totalErrors !== 1 ? 's' : ''} Found
+                </div>
+                <p className="text-xs text-zinc-400">
+                  Pre-verification detected errors in your project. Would you like me to fix them?
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={approveErrorFix}
+                    disabled={isPreVerifying}
+                    className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 rounded-lg text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {isPreVerifying ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Fixing...
+                      </>
+                    ) : (
+                      <>
+                        <Wrench className="w-4 h-4" />
+                        Fix Errors
+                      </>
+                    )}
+                  </button>
+                  <button
+                    onClick={cancelErrorFix}
+                    disabled={isPreVerifying}
+                    className="px-3 py-2 text-zinc-400 hover:text-zinc-300 hover:bg-zinc-800 rounded-lg text-sm transition-colors disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
                 </div>
               </div>
             )}
@@ -531,7 +887,7 @@ function BoltChatPanel({ onFilesystemChange }: BoltChatPanelProps) {
               </button>
             </div>
           </div>
-          <div className="max-h-24 overflow-auto space-y-1">
+          <div className="max-h-24 overflow-y-auto overflow-x-hidden scrollbar-thin space-y-1">
             {buildErrors.slice(0, 5).map((err, i) => (
               <div key={i} className="text-xs text-amber-200/80 font-mono">
                 {err.file && err.line ? (
@@ -608,6 +964,12 @@ function BoltChatPanel({ onFilesystemChange }: BoltChatPanelProps) {
             content: h.action.content,
           }))}
         isLoading={isUndoing}
+      />
+
+      {/* Settings Panel */}
+      <BoltSettingsPanel
+        isOpen={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
       />
     </div>
   );
@@ -750,6 +1112,7 @@ function BoltMainLayout() {
   const [activeTab, setActiveTab] = useState<WorkbenchTab>('preview');
   const [openFiles, setOpenFiles] = useState<BoltOpenFile[]>([]);
   const [activeFile, setActiveFile] = useState<string | null>(null);
+  const [chatCollapsed, setChatCollapsed] = useState(false);
 
   // Ref for save handler
   const openFilesRef = useRef<BoltOpenFile[]>(openFiles);
@@ -792,10 +1155,19 @@ function BoltMainLayout() {
     async (path: string) => {
       if (!webcontainer) return;
       const file = openFilesRef.current.find((f) => f.path === path);
-      if (!file?.content) return;
+
+      // If no content in state, the editor might have auto-saved directly
+      // Just clear the dirty flag in that case
+      if (!file) return;
 
       try {
-        await webcontainer.fs.writeFile(path, file.content);
+        // Only write to disk if we have cached content that hasn't been written yet
+        // Auto-save writes directly and then calls this to clear the flag
+        if (file.content && file.isDirty) {
+          await webcontainer.fs.writeFile(path, file.content);
+        }
+
+        // Clear the dirty flag
         setOpenFiles((prev) =>
           prev.map((f) => (f.path === path ? { ...f, isDirty: false } : f))
         );
@@ -833,9 +1205,45 @@ function BoltMainLayout() {
 
       {/* Main Content: Chat + Workbench */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Chat Panel */}
-        <div className="w-80 flex-shrink-0 border-r border-zinc-800/50">
-          <BoltChatPanel />
+        {/* Chat Panel - Collapsible */}
+        <div
+          className={`flex-shrink-0 border-r border-zinc-800/50 transition-all duration-300 ${
+            chatCollapsed ? 'w-12' : 'w-[352px]'
+          }`}
+        >
+          {chatCollapsed ? (
+            // Collapsed state - show expand button
+            <div className="h-full flex flex-col items-center pt-3 bg-[#0f0f0f]">
+              <button
+                onClick={() => setChatCollapsed(false)}
+                className="p-2 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/50 rounded-lg transition-colors"
+                title="Expand chat"
+              >
+                <PanelLeft className="w-5 h-5" />
+              </button>
+              <div className="mt-4 flex flex-col items-center gap-2">
+                <div className="w-6 h-6 rounded-md bg-gradient-to-br from-violet-500 to-fuchsia-500 flex items-center justify-center">
+                  <Zap className="w-3 h-3 text-white" />
+                </div>
+                <span className="text-zinc-600 text-xs [writing-mode:vertical-lr] rotate-180">Chat</span>
+              </div>
+            </div>
+          ) : (
+            // Expanded state - show full chat with collapse button
+            <div className="h-full flex flex-col">
+              {/* Collapse button bar */}
+              <div className="absolute top-[52px] left-[340px] z-10">
+                <button
+                  onClick={() => setChatCollapsed(true)}
+                  className="p-1 text-zinc-600 hover:text-zinc-300 hover:bg-zinc-800 rounded transition-colors"
+                  title="Collapse chat"
+                >
+                  <PanelLeftClose className="w-4 h-4" />
+                </button>
+              </div>
+              <BoltChatPanel onOpenFile={handleFileSelect} />
+            </div>
+          )}
         </div>
 
         {/* Workbench */}
@@ -901,10 +1309,12 @@ interface BoltPlaygroundLayoutProps {
 
 export function BoltPlaygroundLayout({ templateId }: BoltPlaygroundLayoutProps) {
   return (
-    <ToastProvider>
-      <BoltWebContainerProvider templateId={templateId}>
-        <BoltLayoutInner />
-      </BoltWebContainerProvider>
-    </ToastProvider>
+    <BoltConfigProvider>
+      <ToastProvider>
+        <BoltWebContainerProvider templateId={templateId}>
+          <BoltLayoutInner />
+        </BoltWebContainerProvider>
+      </ToastProvider>
+    </BoltConfigProvider>
   );
 }

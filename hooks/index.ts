@@ -12,3 +12,4 @@ export { useStreamingFileOperations, parseSSEStream } from './useStreamingFileOp
 export type { StreamingState, UseStreamingFileOperationsReturn } from './useStreamingFileOperations';
 export { useProjectAnalysis } from './useProjectAnalysis';
 export type { ProjectAnalysisState, UseProjectAnalysisOptions, ProjectSummary } from './useProjectAnalysis';
+export { useRuntimeErrors } from './useRuntimeErrors';

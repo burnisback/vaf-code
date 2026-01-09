@@ -170,7 +170,7 @@ export function ActionPreviewModal({
         </p>
 
         {/* Actions List */}
-        <div className="max-h-[300px] overflow-auto space-y-2">
+        <div className="max-h-[300px] overflow-y-auto overflow-x-hidden scrollbar-thin space-y-2">
           {actions.map((action, index) => {
             const isSkipped = skippedIndices.has(index);
             const isFile = action.type === 'file';
@@ -308,7 +308,7 @@ export function UndoConfirmModal({
         </div>
 
         {/* Actions to undo */}
-        <div className="max-h-[200px] overflow-auto space-y-1">
+        <div className="max-h-[200px] overflow-y-auto overflow-x-hidden scrollbar-thin space-y-1">
           {actions.slice(0, 10).map((action, index) => (
             <div
               key={index}
