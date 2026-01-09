@@ -1,0 +1,137 @@
+/**
+ * VAF AI Types - Barrel Export
+ *
+ * Central export for all type definitions used in the orchestrator-agent system.
+ */
+
+// Agent types
+export {
+  AgentType,
+  AgentTypeSchema,
+  EngineerMode,
+  EngineerModeSchema,
+  DesignMode,
+  DesignModeSchema,
+  AuthorityLevel,
+  AuthorityLevelSchema,
+  AgentConfigSchema,
+  AGENT_CONFIGS,
+  AgentStatus,
+  AgentStatusSchema,
+  ResponseStatus,
+  ResponseStatusSchema,
+} from './agents';
+
+export type {
+  AgentConfig,
+} from './agents';
+
+// Orchestrator types
+export {
+  TaskType,
+  TaskTypeSchema,
+  PipelineMode,
+  PipelineModeSchema,
+  OutputType,
+  OutputTypeSchema,
+  FileOperationType,
+  FileOperationTypeSchema,
+  WriteOperationSchema,
+  EditSchema,
+  EditOperationSchema,
+  DeleteOperationSchema,
+  FileOperationSchema,
+  CriteriaResultSchema,
+  SelfCheckSchema,
+  ComponentSpecSchema,
+  PlacementSpecSchema,
+  StylingSpecSchema,
+  ResponsiveSpecSchema,
+  AccessibilitySpecSchema,
+  DesignSpecOutputSchema,
+  FileOperationsOutputSchema,
+  DocumentOutputSchema,
+  DecisionOutputSchema,
+  AnalysisOutputSchema,
+  AgentOutputSchema,
+  TaskDefinitionSchema,
+  FileContextSchema,
+  ContextSchema,
+  ExpectedOutputSchema,
+  OrchestratorRequestSchema,
+  ResponseMetadataSchema,
+  AgentResponseSchema,
+  OrchestratorState,
+  OrchestratorStateSchema,
+  ExecutionStepSchema,
+  ExecutionPlanSchema,
+} from './orchestrator';
+
+export type {
+  WriteOperation,
+  Edit,
+  EditOperation,
+  DeleteOperation,
+  FileOperation,
+  CriteriaResult,
+  SelfCheck,
+  ComponentSpec,
+  PlacementSpec,
+  StylingSpec,
+  ResponsiveSpec,
+  AccessibilitySpec,
+  DesignSpecOutput,
+  FileOperationsOutput,
+  DocumentOutput,
+  DecisionOutput,
+  AnalysisOutput,
+  AgentOutput,
+  TaskDefinition,
+  FileContext,
+  Context,
+  ExpectedOutput,
+  OrchestratorRequest,
+  ResponseMetadata,
+  AgentResponse,
+  ExecutionStep,
+  ExecutionPlan,
+} from './orchestrator';
+
+// Context types
+export {
+  ProjectType,
+  ProjectTypeSchema,
+  ProjectStateSchema,
+  ColorTokensSchema,
+  SpacingTokensSchema,
+  TypographyTokensSchema,
+  DesignSystemContextSchema,
+  PageLayoutContextSchema,
+  VisualHierarchyContextSchema,
+  DesignContextSchema,
+  ConversationMessageSchema,
+  ConversationContextSchema,
+  IntentSchema,
+  ComplexitySchema,
+  ClassificationResultSchema,
+  FullTaskContextSchema,
+  DEFAULT_PRUNING_RULES,
+} from './context';
+
+export type {
+  ProjectState,
+  ColorTokens,
+  SpacingTokens,
+  TypographyTokens,
+  DesignSystemContext,
+  PageLayoutContext,
+  VisualHierarchyContext,
+  DesignContext,
+  ConversationMessage,
+  ConversationContext,
+  Intent,
+  Complexity,
+  ClassificationResult,
+  FullTaskContext,
+  ContextPruningRules,
+} from './context';
