@@ -12,3 +12,23 @@ export { BoltPreview } from './BoltPreview';
 
 // Complex mode components
 export { PlanPreview, PlanPreviewSkeleton, PlanSummaryBadge } from './complex';
+
+// Mega-complex mode components
+export {
+  MegaComplexPanel,
+  MegaComplexMessage,
+  MegaComplexBadge,
+  TodoList,
+  MiniTodoList,
+  CurrentTodo,
+  ApprovalDialog,
+  ApprovalStatusBadge,
+  ApprovalCard,
+  ApprovalList,
+  ProgressIndicator,
+  MiniProgressBadge,
+  StageProgressCard,
+} from './mega';
+
+// Orchestration components
+export { OrchestrationPanel, OrchestrationStatus } from './orchestration';

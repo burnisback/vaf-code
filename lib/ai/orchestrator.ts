@@ -323,7 +323,21 @@ When answering questions about this project:
     // Build the full prompt
     const fullPrompt = `${systemPrompt}${conversationContext}
 
-User: ${message}
+User: ${message}`;
+
+    // Call AI to generate response
+    const response = await ai.generate({
+      model: MODELS.flash,
+      prompt: fullPrompt,
+    });
+
+    return response.text;
+  }
+
+  /**
+   * Generate QA review for engineer response
+   */
+  private async generateQAReview(
     message: string,
     context: FullTaskContext,
     engineerResponse: AgentResponse,

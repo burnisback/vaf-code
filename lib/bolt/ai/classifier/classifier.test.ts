@@ -53,7 +53,8 @@ describe('classifyRequest', () => {
 
   describe('Simple Mode', () => {
     it('should classify single component request as simple', () => {
-      const result = classifyRequest('Add a logout button');
+      // Use "red button" to avoid triggering auth domain (logout) or database domain (save)
+      const result = classifyRequest('Add a red button');
       expect(result.mode).toBe('simple');
       expect(result.estimatedFiles).toBeLessThanOrEqual(2);
     });

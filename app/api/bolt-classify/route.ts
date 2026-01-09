@@ -19,13 +19,17 @@
  * }
  */
 
-import { ai, MODELS } from '@/lib/ai/genkit';
+import { ai } from '@/lib/ai/genkit';
 import type {
   ClassificationResult,
   RequestMode,
   RequestDomain,
   MegaComplexIndicators,
 } from '@/lib/bolt/ai/classifier/types';
+import {
+  selectAndGetModel,
+  formatSelectionLog,
+} from '@/lib/bolt/ai/modelRouter';
 
 // Force dynamic rendering
 export const dynamic = 'force-dynamic';
@@ -49,6 +53,7 @@ function buildClassificationPrompt(userPrompt: string): string {
 Respond with this exact JSON structure:
 {
   "isQuestion": boolean,
+  "isErrorFix": boolean,
   "estimatedFiles": number,
   "domains": string[],
   "complexityScore": number,
@@ -59,12 +64,24 @@ Respond with this exact JSON structure:
 
 Field definitions:
 - isQuestion: true ONLY if asking for explanation/information, NOT requesting code changes
+- isErrorFix: true if the user is reporting errors, bugs, or asking to fix/debug something
 - estimatedFiles: number of files to create/modify (1-2=simple, 3-5=moderate, 6-15=complex, 16+=mega)
 - domains: array from ["frontend", "backend", "database", "auth", "api", "styling", "testing", "infrastructure"]
 - complexityScore: 1-3=simple, 4-9=moderate, 10-15=complex, 16+=mega-complex
 - needsResearch: true only if requires competitor analysis, market research, or studying external systems
 - needsPlanning: true if complex enough to benefit from a step-by-step plan before execution
 - reasoning: brief 1-sentence explanation of your classification
+
+IMPORTANT - isErrorFix detection:
+Set isErrorFix=true for ANY of these patterns:
+- "fix errors/bugs" or "still getting errors" or "getting errors"
+- "not working" or "broken" or "failing" or "doesn't compile"
+- "build failing" or "build errors" or "compilation errors"
+- "can't run/start/build" or "won't build/compile"
+- "debug" or "diagnose" or "what's wrong"
+- "review and fix" or "check for errors"
+- Any mention of specific error messages being encountered
+- User reporting that something they tried didn't work
 
 IMPORTANT - Consider implicit complexity:
 - "validation" = validation logic + error handling + error display + types
@@ -85,6 +102,7 @@ IMPORTANT - Consider implicit complexity:
 
 interface LLMClassificationResponse {
   isQuestion: boolean;
+  isErrorFix: boolean;
   estimatedFiles: number;
   domains: string[];
   complexityScore: number;
@@ -101,6 +119,10 @@ interface ClassifyRequest {
 interface ClassifyResponse {
   result: ClassificationResult | null;
   usedLLM: boolean;
+  modelInfo?: {
+    tier: string;
+    reason: string;
+  };
 }
 
 // =============================================================================
@@ -129,6 +151,7 @@ function parseClassificationResponse(text: string): LLMClassificationResponse | 
 
     return {
       isQuestion: parsed.isQuestion,
+      isErrorFix: Boolean(parsed.isErrorFix),
       estimatedFiles: Math.max(0, Math.round(parsed.estimatedFiles)),
       domains: parsed.domains.filter((d: unknown) => typeof d === 'string'),
       complexityScore: Math.max(1, Math.min(20, parsed.complexityScore)),
@@ -193,6 +216,7 @@ function convertToClassificationResult(
     reasoning: `[AI] ${llmResponse.reasoning || `Complexity score: ${llmResponse.complexityScore}, ${llmResponse.estimatedFiles} files, ${validDomains.length} domains`}`,
     detectedKeywords: [], // LLM doesn't use keywords
     megaComplexIndicators,
+    isErrorFix: llmResponse.isErrorFix,
   };
 }
 
@@ -215,6 +239,13 @@ export async function POST(request: Request) {
 
     const classificationPrompt = buildClassificationPrompt(prompt);
 
+    // Select optimal model for classification (always Flash-Lite)
+    const { model, selection } = selectAndGetModel({
+      phase: 'classify',
+      mode: 'simple', // Initial classification doesn't know mode yet
+    });
+    console.log(formatSelectionLog({ phase: 'classify', mode: 'simple' }, selection));
+
     // Create a timeout promise to race against the LLM call
     const timeoutPromise = new Promise<null>((resolve) => {
       setTimeout(() => resolve(null), timeout);
@@ -223,7 +254,7 @@ export async function POST(request: Request) {
     // Call the LLM with a race against the timeout
     const response = await Promise.race([
       ai.generate({
-        model: MODELS.FLASH,
+        model,
         system: CLASSIFICATION_SYSTEM_PROMPT,
         prompt: classificationPrompt,
         config: {
@@ -261,6 +292,10 @@ export async function POST(request: Request) {
     return Response.json({
       result,
       usedLLM: true,
+      modelInfo: {
+        tier: selection.tier,
+        reason: selection.reason,
+      },
     } satisfies ClassifyResponse);
 
   } catch (error) {

@@ -43,3 +43,36 @@ export {
   allowsUserIntervention,
   getApprovalType,
 } from './machine';
+
+// Cost tracking (client-safe)
+export {
+  CostTracker,
+  createCostTracker,
+  formatCost,
+  formatTokens,
+  getCostSummary,
+  MODEL_COSTS,
+} from './costTracker';
+export type {
+  TokenUsage,
+  CostStatistics,
+  BudgetWarning,
+  CostTrackerCallbacks,
+} from './costTracker';
+
+// Approval management (client-safe)
+export {
+  ApprovalManager,
+  createApprovalManager,
+  getApprovalTypeTitle,
+  getApprovalTypeDescription,
+  formatDecisionTime,
+} from './approvalManager';
+export type {
+  ApprovalType,
+  ApprovalStatus,
+  ApprovalRequest,
+  ApprovalManagerCallbacks,
+  ApprovalManagerConfig,
+  ApprovalResult,
+} from './approvalManager';

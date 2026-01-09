@@ -25,6 +25,7 @@ import {
   PRODUCT_KEYWORDS,
   SCALE_KEYWORDS,
   IMPLEMENTATION_KEYWORDS,
+  ERROR_FIX_KEYWORDS,
 } from './types';
 
 import { classifyWithLLM, type LLMClassifierOptions } from './llmClassifier';
@@ -38,6 +39,22 @@ export { classifyWithLLM, type LLMClassifierOptions } from './llmClassifier';
 // =============================================================================
 
 /**
+ * Check if the prompt indicates error-fix intent (keyword-based fallback)
+ */
+function detectErrorFixIntent(prompt: string): boolean {
+  const lowerPrompt = prompt.toLowerCase();
+
+  // Check for error-fix keywords
+  for (const keyword of ERROR_FIX_KEYWORDS) {
+    if (lowerPrompt.includes(keyword.toLowerCase())) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * Classify a user request to determine handling mode
  */
 export function classifyRequest(
@@ -45,6 +62,9 @@ export function classifyRequest(
   config: ClassifierConfig = DEFAULT_CLASSIFIER_CONFIG
 ): ClassificationResult {
   const lowerPrompt = prompt.toLowerCase();
+
+  // Detect error-fix intent early (applies to all modes)
+  const isErrorFix = detectErrorFixIntent(lowerPrompt);
 
   // 1. Check for question patterns first
   if (isQuestion(prompt)) {
@@ -55,6 +75,7 @@ export function classifyRequest(
       confidence: 0.9,
       reasoning: 'Request appears to be a question, not a code generation task',
       detectedKeywords: [],
+      isErrorFix,
     };
   }
 
@@ -73,6 +94,7 @@ export function classifyRequest(
         ...megaComplexIndicators.scaleIndicators,
       ],
       megaComplexIndicators,
+      isErrorFix,
     };
   }
 
@@ -99,6 +121,7 @@ export function classifyRequest(
     confidence,
     reasoning,
     detectedKeywords: fileIndicators,
+    isErrorFix,
   };
 }
 

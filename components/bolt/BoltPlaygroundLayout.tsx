@@ -66,6 +66,18 @@ import {
   IterationBadge,
   type IterationStatus,
 } from './complex';
+// Mega-complex mode components
+import {
+  MiniTodoList,
+  CurrentTodo,
+  ApprovalDialog,
+  MiniProgressBadge,
+  MegaComplexPanel,
+  MegaComplexMessage,
+  type MegaComplexMessageType,
+  EvidenceLog,
+  MiniEvidenceLog,
+} from './mega';
 import { BoltConfigProvider, useBoltConfig } from '@/lib/bolt/config';
 import { BoltSettingsPanel } from './settings';
 import { EnhancedChatMessage } from '@/components/chat/EnhancedChatMessage';
@@ -229,22 +241,90 @@ function ChatMessage({ message, executionPhase, executionTasks, onOpenFile }: Ch
 }
 
 // =============================================================================
+// HELPERS
+// =============================================================================
+
+/**
+ * Detect if a message is a mega-complex orchestration update and return its type.
+ * Returns null if it's a regular message.
+ */
+function detectMegaComplexMessageType(content: string): MegaComplexMessageType | null {
+  const lowerContent = content.toLowerCase();
+
+  // Research related
+  if (lowerContent.includes('research complete') || lowerContent.includes('researching domain')) {
+    return 'research';
+  }
+
+  // PRD related
+  if (lowerContent.includes('prd') || lowerContent.includes('product requirements')) {
+    return 'prd';
+  }
+
+  // Architecture related
+  if (lowerContent.includes('architecture') || lowerContent.includes('technical design')) {
+    return 'architecture';
+  }
+
+  // Phase related
+  if (lowerContent.includes('phase') && (lowerContent.includes('starting') || lowerContent.includes('complete'))) {
+    return 'phase';
+  }
+
+  // Approval related
+  if (lowerContent.includes('approval') || lowerContent.includes('approve')) {
+    return 'approval';
+  }
+
+  // Complete
+  if (lowerContent.includes('project complete') || lowerContent.includes('successfully built')) {
+    return 'complete';
+  }
+
+  // Error
+  if (lowerContent.includes('orchestration') && lowerContent.includes('error')) {
+    return 'error';
+  }
+
+  return null;
+}
+
+/**
+ * Extract title from mega-complex message content
+ */
+function extractMegaComplexTitle(content: string, type: MegaComplexMessageType): string {
+  const titles: Record<MegaComplexMessageType, string> = {
+    research: 'Research Update',
+    prd: 'Product Requirements',
+    architecture: 'Architecture Design',
+    phase: 'Implementation Phase',
+    approval: 'Approval Required',
+    complete: 'Project Complete',
+    error: 'Execution Error',
+  };
+  return titles[type];
+}
+
+// =============================================================================
 // CHAT PANEL
 // =============================================================================
 
 interface BoltChatPanelProps {
   onFilesystemChange?: () => void;
   onOpenFile?: (path: string) => void;
+  /** Flush pending editor changes to WebContainer before verification */
+  flushPendingEdits?: () => Promise<void>;
 }
 
-function BoltChatPanel({ onFilesystemChange, onOpenFile }: BoltChatPanelProps) {
-  const { webcontainer, writeToTerminal, triggerFilesystemRefresh } = useBoltWebContainer();
+function BoltChatPanel({ onFilesystemChange, onOpenFile, flushPendingEdits }: BoltChatPanelProps) {
+  const { webcontainer, writeToTerminal, triggerFilesystemRefresh, getTerminalErrors, clearTerminalHistory } = useBoltWebContainer();
   const { config } = useBoltConfig();
   const [input, setInput] = useState('');
   const [showHistory, setShowHistory] = useState(false);
   const [showUndoConfirm, setShowUndoConfirm] = useState(false);
   const [isUndoing, setIsUndoing] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isMegaPanelOpen, setIsMegaPanelOpen] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const toast = useToastHelpers();
@@ -316,6 +396,31 @@ function BoltChatPanel({ onFilesystemChange, onOpenFile }: BoltChatPanelProps) {
     // Pre-verification actions (Phase 3)
     approveErrorFix,
     cancelErrorFix,
+    // Orchestration state (mega-complex mode)
+    orchestrationState,
+    orchestrationContext,
+    orchestrationProgress,
+    isMegaComplexMode,
+    // Orchestration actions
+    approveOrchestrationStep,
+    rejectOrchestrationStep,
+    pauseOrchestration,
+    resumeOrchestration,
+    abortOrchestration,
+    // Todo system state
+    todos,
+    currentTodo,
+    todoProgress,
+    // Orchestration data from each phase
+    researchData,
+    prdData,
+    architectureData,
+    // Investigation layer state (read-before-edit)
+    investigationResult,
+    isInvestigating,
+    // Debug pipeline state
+    debugPipelineResult,
+    debugPipelineProgress,
   } = useBoltChat({
     webcontainer,
     onFilesystemChange: () => {
@@ -328,6 +433,12 @@ function BoltChatPanel({ onFilesystemChange, onOpenFile }: BoltChatPanelProps) {
     getRuntimeErrors: getRuntimeErrorsCallback,
     clearRuntimeErrors: clearAllRuntimeErrors,
     runtimeErrorCheckDelay: config.complexMode.runtimeErrorCheckDelay || 3000,
+    // Flush function to save pending editor changes before verification
+    flushPendingEdits,
+    // Pass terminal errors from dev server output
+    getTerminalErrors,
+    // Clear terminal history after successful fix to prevent stale errors
+    clearTerminalErrors: clearTerminalHistory,
   });
 
   // Handle auto-debug for runtime errors
@@ -676,15 +787,104 @@ function BoltChatPanel({ onFilesystemChange, onOpenFile }: BoltChatPanelProps) {
           </div>
         ) : (
           <>
-            {messages.map((message, index) => (
-              <ChatMessage
-                key={message.id}
-                message={message}
-                executionPhase={index === messages.length - 1 ? currentExecutionPhase : undefined}
-                executionTasks={index === messages.length - 1 ? executionTasks : undefined}
-                onOpenFile={onOpenFile}
-              />
-            ))}
+            {messages.map((message, index) => {
+              // In mega-complex mode, check if this is an orchestration message
+              const megaType = isMegaComplexMode && message.role === 'assistant'
+                ? detectMegaComplexMessageType(message.content)
+                : null;
+
+              // Render as MegaComplexMessage if it's an orchestration update
+              if (megaType) {
+                return (
+                  <div key={message.id} className="mb-3">
+                    <MegaComplexMessage
+                      type={megaType}
+                      title={extractMegaComplexTitle(message.content, megaType)}
+                      content={message.content}
+                      onViewDetails={() => setIsMegaPanelOpen(true)}
+                      onApprove={megaType === 'approval' ? approveOrchestrationStep : undefined}
+                      onReject={megaType === 'approval' ? () => rejectOrchestrationStep() : undefined}
+                    />
+                  </div>
+                );
+              }
+
+              // Regular message
+              return (
+                <ChatMessage
+                  key={message.id}
+                  message={message}
+                  executionPhase={index === messages.length - 1 ? currentExecutionPhase : undefined}
+                  executionTasks={index === messages.length - 1 ? executionTasks : undefined}
+                  onOpenFile={onOpenFile}
+                />
+              );
+            })}
+
+            {/* Mega-Complex Mode: Progress and Todo Tracking */}
+            {isMegaComplexMode && orchestrationState && (
+              <div className="mb-3 space-y-2">
+                {/* Pipeline Progress Indicator */}
+                <div className="flex items-center justify-between">
+                  <MiniProgressBadge
+                    state={orchestrationState}
+                  />
+                  <button
+                    onClick={() => setIsMegaPanelOpen(true)}
+                    className="text-xs text-violet-400 hover:text-violet-300 hover:underline"
+                  >
+                    View Full Panel
+                  </button>
+                </div>
+
+                {/* Current Todo Task */}
+                {currentTodo && (
+                  <CurrentTodo todo={currentTodo} />
+                )}
+
+                {/* Mini Todo List */}
+                {todos.length > 0 && (
+                  <MiniTodoList
+                    todos={todos}
+                    showCount={3}
+                  />
+                )}
+
+                {/* Investigation Evidence Log (read-before-edit results) */}
+                {(investigationResult || isInvestigating) && (
+                  <EvidenceLog
+                    investigation={investigationResult}
+                    isInvestigating={isInvestigating}
+                    className="mt-2"
+                    onViewFile={onOpenFile}
+                  />
+                )}
+              </div>
+            )}
+
+            {/* Mega-Complex Mode: Approval Dialog */}
+            {isMegaComplexMode && orchestrationState && (
+              orchestrationState === 'awaiting-approval' ||
+              orchestrationState.toString().includes('awaiting')
+            ) && orchestrationContext && (
+              <div className="mb-3">
+                <ApprovalDialog
+                  request={{
+                    id: `approval-${Date.now()}`,
+                    type: orchestrationState === 'awaiting-approval'
+                      ? (orchestrationContext.currentPhaseId ? 'phase' : 'architecture')
+                      : 'research',
+                    title: `Approve ${orchestrationContext.currentPhaseId || 'Architecture'}`,
+                    description: orchestrationContext.error || 'Ready for your review',
+                    content: orchestrationContext,
+                    status: 'pending',
+                    createdAt: Date.now(),
+                  }}
+                  onApprove={approveOrchestrationStep}
+                  onReject={(reason) => rejectOrchestrationStep(reason)}
+                />
+              </div>
+            )}
 
             {/* Plan Generation Loading State */}
             {isGeneratingPlan && (
@@ -971,6 +1171,47 @@ function BoltChatPanel({ onFilesystemChange, onOpenFile }: BoltChatPanelProps) {
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}
       />
+
+      {/* Mega-Complex Panel Sidebar */}
+      {isMegaComplexMode && orchestrationState && orchestrationContext && (
+        <div
+          className={`fixed inset-y-0 right-0 w-96 bg-zinc-900 border-l border-zinc-800 shadow-xl transform transition-transform duration-300 z-50 ${
+            isMegaPanelOpen ? 'translate-x-0' : 'translate-x-full'
+          }`}
+        >
+          <div className="flex items-center justify-between p-3 border-b border-zinc-800">
+            <h2 className="text-sm font-medium text-white">Mega-Complex Project</h2>
+            <button
+              onClick={() => setIsMegaPanelOpen(false)}
+              className="p-1 text-zinc-400 hover:text-white transition-colors"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+          <div className="h-full overflow-hidden">
+            <MegaComplexPanel
+              state={orchestrationState}
+              context={orchestrationContext}
+              researchData={researchData}
+              prdData={prdData}
+              architectureData={architectureData}
+              onApprove={approveOrchestrationStep}
+              onReject={() => rejectOrchestrationStep()}
+              onPause={pauseOrchestration}
+              onResume={resumeOrchestration}
+              onAbort={abortOrchestration}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Backdrop for Mega Panel */}
+      {isMegaPanelOpen && (
+        <div
+          className="fixed inset-0 bg-black/50 z-40"
+          onClick={() => setIsMegaPanelOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -1179,6 +1420,35 @@ function BoltMainLayout() {
     [webcontainer, triggerFilesystemRefresh]
   );
 
+  // Flush all dirty files to WebContainer before verification
+  // This ensures any pending editor changes are saved
+  const flushAllDirtyFiles = useCallback(async () => {
+    if (!webcontainer) return;
+
+    const dirtyFiles = openFilesRef.current.filter((f) => f.isDirty && f.content);
+    if (dirtyFiles.length === 0) return;
+
+    console.log('[BoltPlayground] Flushing', dirtyFiles.length, 'dirty file(s) before verification');
+
+    try {
+      await Promise.all(
+        dirtyFiles.map(async (file) => {
+          if (file.content) {
+            await webcontainer.fs.writeFile(file.path, file.content);
+            console.log('[BoltPlayground] Flushed:', file.path);
+          }
+        })
+      );
+
+      // Clear dirty flags
+      setOpenFiles((prev) =>
+        prev.map((f) => (dirtyFiles.some((d) => d.path === f.path) ? { ...f, isDirty: false } : f))
+      );
+    } catch (error) {
+      console.error('[BoltPlayground] Flush error:', error);
+    }
+  }, [webcontainer]);
+
   return (
     <div className="h-screen flex flex-col bg-[#0a0a0a] overflow-hidden">
       {/* Header */}
@@ -1241,7 +1511,7 @@ function BoltMainLayout() {
                   <PanelLeftClose className="w-4 h-4" />
                 </button>
               </div>
-              <BoltChatPanel onOpenFile={handleFileSelect} />
+              <BoltChatPanel onOpenFile={handleFileSelect} flushPendingEdits={flushAllDirtyFiles} />
             </div>
           )}
         </div>

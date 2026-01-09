@@ -43,6 +43,13 @@ import { BOLT_SYSTEM_PROMPT, buildContextualPrompt } from '@/lib/bolt/ai/prompts
 import { parseArtifacts } from '@/lib/bolt/ai/parser';
 import type { BoltGenerateRequest, BoltStreamChunk } from '@/lib/bolt/types';
 import type { ClassificationResult } from '@/lib/bolt/ai/classifier';
+import {
+  selectAndGetModel,
+  formatSelectionLog,
+  type Phase,
+} from '@/lib/bolt/ai/modelRouter';
+// Investigation layer integration
+import type { InvestigationResult } from '@/lib/bolt/investigation';
 
 // Question mode system prompt - comprehensive project-aware answering
 const QUESTION_SYSTEM_PROMPT = `You are an expert AI assistant with deep knowledge of the user's web development project.
@@ -70,14 +77,65 @@ export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
 // =============================================================================
+// INVESTIGATION CONTEXT BUILDER
+// =============================================================================
+
+/**
+ * Build context string from investigation results
+ */
+function buildInvestigationContext(result: InvestigationResult): string | null {
+  if (!result.success || !result.findings.length) {
+    return null;
+  }
+
+  const parts: string[] = ['<investigation_findings>'];
+
+  // Add key findings
+  if (result.findings.length > 0) {
+    parts.push('Key findings from code investigation:');
+    for (const finding of result.findings) {
+      const files = finding.files.length > 0
+        ? ` (files: ${finding.files.slice(0, 3).join(', ')})`
+        : '';
+      parts.push(`- ${finding.description}${files}`);
+      if (finding.suggestion) {
+        parts.push(`  Suggestion: ${finding.suggestion}`);
+      }
+    }
+  }
+
+  // Add suggested approach if available
+  if (result.suggestedApproach) {
+    parts.push('');
+    parts.push(`Suggested approach: ${result.suggestedApproach}`);
+  }
+
+  // Add files that should be read
+  if (result.filesToRead.required.length > 0) {
+    parts.push('');
+    parts.push('Files to read before making changes:');
+    for (const file of result.filesToRead.required.slice(0, 5)) {
+      parts.push(`- ${file.filePath} (${file.reason})`);
+    }
+  }
+
+  parts.push('</investigation_findings>');
+
+  return parts.join('\n');
+}
+
+// =============================================================================
 // ROUTE HANDLER
 // =============================================================================
 
 export async function POST(request: Request) {
   try {
     // Parse request body
-    const body = await request.json() as BoltGenerateRequest & { classification?: ClassificationResult };
-    const { prompt, projectContext, conversationHistory, classification } = body;
+    const body = await request.json() as BoltGenerateRequest & {
+      classification?: ClassificationResult;
+      investigationResult?: InvestigationResult;
+    };
+    const { prompt, projectContext, conversationHistory, classification, investigationResult } = body;
 
     // Validate request
     if (!prompt || typeof prompt !== 'string') {
@@ -168,15 +226,29 @@ ${prompt}
           content: m.content,
         }))
       );
+
+      // Add investigation findings to context if available
+      if (investigationResult && investigationResult.success) {
+        const investigationContext = buildInvestigationContext(investigationResult);
+        if (investigationContext) {
+          contextualPrompt = `${investigationContext}\n\n${contextualPrompt}`;
+        }
+      }
     }
 
     // Select system prompt based on mode
     const systemPrompt = isQuestionMode ? QUESTION_SYSTEM_PROMPT : BOLT_SYSTEM_PROMPT;
 
-    // Select model based on mode (pro for complex, flash for others)
-    const selectedModel = (mode === 'complex' || mode === 'mega-complex')
-      ? MODELS.PRO
-      : MODELS.FLASH;
+    // Determine phase based on mode
+    const phase: Phase = isQuestionMode ? 'investigate' : 'execute';
+
+    // Select model using smart router (cost-optimized)
+    const { model: selectedModel, selection } = selectAndGetModel({
+      phase,
+      mode,
+      complexityScore: classification?.estimatedFiles,
+    });
+    console.log(formatSelectionLog({ phase, mode, complexityScore: classification?.estimatedFiles }, selection));
 
     // Create SSE stream
     const encoder = new TextEncoder();

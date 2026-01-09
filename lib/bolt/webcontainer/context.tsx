@@ -24,6 +24,14 @@ import type { BoltLoadingState, BoltWebContainerState } from '../types';
 // CONTEXT TYPES
 // =============================================================================
 
+/** Terminal error parsed from dev server output */
+export interface TerminalError {
+  type: string;
+  message: string;
+  file?: string;
+  line?: number;
+}
+
 interface BoltWebContainerContextValue extends BoltWebContainerState {
   webcontainer: WebContainer | null;
   previewUrl: string | null;
@@ -32,6 +40,12 @@ interface BoltWebContainerContextValue extends BoltWebContainerState {
   writeToTerminal: (data: string) => void;
   registerTerminalWriter: (writer: (data: string) => void) => void;
   retryInit: () => void;
+  /** Get raw terminal history for debugging */
+  getTerminalHistory: () => string[];
+  /** Get parsed errors from terminal output */
+  getTerminalErrors: () => TerminalError[];
+  /** Clear terminal history */
+  clearTerminalHistory: () => void;
 }
 
 // =============================================================================
@@ -71,6 +85,10 @@ export function BoltWebContainerProvider({
   const outputBufferRef = useRef<string[]>([]);
   const mountedRef = useRef(true);
 
+  // Persistent terminal buffer for error detection (keep last 200 entries)
+  const terminalHistoryRef = useRef<string[]>([]);
+  const MAX_TERMINAL_HISTORY = 200;
+
   // Update loading state helper
   const updateLoadingState = useCallback((state: BoltLoadingState, message?: string) => {
     setLoadingState(state);
@@ -81,11 +99,89 @@ export function BoltWebContainerProvider({
 
   // Write to terminal
   const writeToTerminal = useCallback((data: string) => {
+    // Always save to history buffer for error detection
+    terminalHistoryRef.current.push(data);
+    if (terminalHistoryRef.current.length > MAX_TERMINAL_HISTORY) {
+      terminalHistoryRef.current.shift();
+    }
+
     if (terminalWriterRef.current) {
       terminalWriterRef.current(data);
     } else {
       outputBufferRef.current.push(data);
     }
+  }, []);
+
+  // Get terminal history for error detection
+  const getTerminalHistory = useCallback((): string[] => {
+    return [...terminalHistoryRef.current];
+  }, []);
+
+  // Parse terminal history for errors
+  const getTerminalErrors = useCallback((): Array<{ type: string; message: string; file?: string; line?: number }> => {
+    const errors: Array<{ type: string; message: string; file?: string; line?: number }> = [];
+    const fullOutput = terminalHistoryRef.current.join('');
+
+    // Vite internal server error pattern
+    const viteErrorRegex = /\[vite\] Internal server error: (.+?)(?:\r?\n|$)/gi;
+    let match;
+    while ((match = viteErrorRegex.exec(fullOutput)) !== null) {
+      errors.push({ type: 'vite', message: match[1] });
+    }
+
+    // ESBuild/Rollup error pattern: ✘ [ERROR] message
+    const esbuildErrorRegex = /✘ \[ERROR\] (.+?)(?:\r?\n|$)/gi;
+    while ((match = esbuildErrorRegex.exec(fullOutput)) !== null) {
+      errors.push({ type: 'esbuild', message: match[1] });
+    }
+
+    // SyntaxError pattern
+    const syntaxErrorRegex = /SyntaxError: (.+?)(?:\r?\n|$)/gi;
+    while ((match = syntaxErrorRegex.exec(fullOutput)) !== null) {
+      errors.push({ type: 'syntax', message: match[1] });
+    }
+
+    // Transform error pattern (Vite/ESBuild): file.jsx:line:col - error message
+    const transformErrorRegex = /(?:error|Error)[:\s]+(.+\.(?:jsx?|tsx?|vue|svelte))(?::(\d+))?(?::(\d+))?[:\s]+(.+?)(?:\r?\n|$)/gi;
+    while ((match = transformErrorRegex.exec(fullOutput)) !== null) {
+      errors.push({
+        type: 'transform',
+        message: match[4],
+        file: match[1],
+        line: match[2] ? parseInt(match[2], 10) : undefined,
+      });
+    }
+
+    // Failed to parse/transform pattern
+    const failedParseRegex = /(?:Failed to parse|Failed to transform|Could not resolve)[:\s]+(.+?)(?:\r?\n|$)/gi;
+    while ((match = failedParseRegex.exec(fullOutput)) !== null) {
+      errors.push({ type: 'parse', message: match[1] });
+    }
+
+    // Module not found pattern
+    const moduleNotFoundRegex = /(?:Cannot find module|Module not found)[:\s]+['"]?([^'"]+)['"]?/gi;
+    while ((match = moduleNotFoundRegex.exec(fullOutput)) !== null) {
+      errors.push({ type: 'module', message: `Cannot find module: ${match[1]}` });
+    }
+
+    // React/JSX compilation errors
+    const jsxErrorRegex = /(?:Unexpected token|Expected corresponding JSX closing tag)(.+?)(?:\r?\n|$)/gi;
+    while ((match = jsxErrorRegex.exec(fullOutput)) !== null) {
+      errors.push({ type: 'jsx', message: match[0].trim() });
+    }
+
+    // npm ERR pattern
+    const npmErrorRegex = /npm ERR! (.+?)(?:\r?\n|$)/gi;
+    while ((match = npmErrorRegex.exec(fullOutput)) !== null) {
+      errors.push({ type: 'npm', message: match[1] });
+    }
+
+    return errors;
+  }, []);
+
+  // Clear terminal history (useful when project is reset)
+  const clearTerminalHistory = useCallback(() => {
+    terminalHistoryRef.current = [];
   }, []);
 
   // Register terminal writer
@@ -238,6 +334,9 @@ export function BoltWebContainerProvider({
     writeToTerminal,
     registerTerminalWriter,
     retryInit,
+    getTerminalHistory,
+    getTerminalErrors,
+    clearTerminalHistory,
   };
 
   return (

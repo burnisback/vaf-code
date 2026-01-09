@@ -5,7 +5,7 @@
  * ONLY import this file in server-side code (API routes).
  */
 
-import { ai, MODELS } from '@/lib/ai/genkit';
+import { ai } from '@/lib/ai/genkit';
 import { PLANNING_SYSTEM_PROMPT, buildPlanningPrompt } from './prompts';
 import type {
   TaskPlan,
@@ -15,6 +15,10 @@ import type {
   PlanGenerationResponse,
 } from './types';
 import { validatePlan } from './utils';
+import {
+  selectAndGetModel,
+  formatSelectionLog,
+} from '../modelRouter';
 
 // =============================================================================
 // MAIN PLANNER FUNCTION
@@ -27,7 +31,7 @@ import { validatePlan } from './utils';
 export async function generatePlan(
   request: PlanGenerationRequest
 ): Promise<PlanGenerationResponse> {
-  const { prompt, projectContext, conversationHistory } = request;
+  const { prompt, projectContext, conversationHistory, mode, complexityScore } = request;
 
   // Build the planning prompt
   const planningPrompt = buildPlanningPrompt(
@@ -36,9 +40,17 @@ export async function generatePlan(
     conversationHistory
   );
 
-  // Generate plan using Pro model for better reasoning
+  // Select model using smart router (Flash for most, Pro for mega-complex)
+  const { model, selection } = selectAndGetModel({
+    phase: 'plan',
+    mode: mode || 'moderate',
+    complexityScore,
+  });
+  console.log(formatSelectionLog({ phase: 'plan', mode: mode || 'moderate', complexityScore }, selection));
+
+  // Generate plan
   const response = await ai.generate({
-    model: MODELS.PRO,
+    model,
     system: PLANNING_SYSTEM_PROMPT,
     prompt: planningPrompt,
     config: {

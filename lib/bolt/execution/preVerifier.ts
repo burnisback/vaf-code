@@ -27,12 +27,33 @@ import { TargetedTestRunner, type TargetedTestResult } from './targetedTestRunne
 // TYPES
 // =============================================================================
 
+export interface JsonValidationError {
+  /** File path with the error */
+  file: string;
+  /** Error message */
+  message: string;
+  /** Line number (if available) */
+  line?: number;
+  /** Column number (if available) */
+  column?: number;
+}
+
+export interface JsonValidationResult {
+  /** Whether all JSON files are valid */
+  success: boolean;
+  /** List of JSON validation errors */
+  errors: JsonValidationError[];
+}
+
 export interface PreVerificationResult {
   /** Whether the project is clean (no errors) */
   isClean: boolean;
 
   /** Total number of errors found */
   totalErrors: number;
+
+  /** JSON validation result (package.json, tsconfig.json, etc.) */
+  jsonValidation: JsonValidationResult | null;
 
   /** Static analysis result (tsc --noEmit) */
   staticAnalysis: StaticAnalysisResult | null;
@@ -115,11 +136,17 @@ const DEFAULT_CONFIG: PreVerifierConfig = {
 };
 
 // =============================================================================
-// INTENT DETECTION
+// INTENT DETECTION (DEPRECATED - Use AI-based classification instead)
 // =============================================================================
 
 /**
- * Patterns that indicate user wants to fix/review errors
+ * @deprecated Use classification.isErrorFix from @/lib/bolt/ai/classifier instead.
+ * These regex patterns are kept as fallback for edge cases only.
+ *
+ * The AI-based classifier in bolt-classify API provides much more accurate
+ * error-fix intent detection by understanding semantic meaning.
+ *
+ * Patterns that indicate user wants to fix/review errors (legacy fallback)
  */
 const ERROR_FIX_PATTERNS = [
   /fix\s+(the\s+)?errors?/i,
@@ -134,6 +161,23 @@ const ERROR_FIX_PATTERNS = [
   /clean\s+up\s+(the\s+)?(code|files?)/i,
   /resolve\s+(the\s+)?issues?/i,
   /address\s+(the\s+)?errors?/i,
+  // "Still getting errors" patterns - critical for ongoing debugging
+  /still\s+(getting|having|seeing)\s+(some\s+)?errors?/i,
+  /getting\s+(some\s+)?errors?/i,
+  /having\s+(some\s+)?errors?/i,
+  /seeing\s+(some\s+)?errors?/i,
+  /there\s+(are|is)\s+(still\s+)?(some\s+)?errors?/i,
+  /errors?\s+(are\s+)?(still\s+)?(there|present|showing)/i,
+  /keep\s+getting\s+errors?/i,
+  // Build/compilation failure patterns
+  /can('t|not)\s+(build|compile|run|start)/i,
+  /build\s+(is\s+)?fail(ing|ed|s)?/i,
+  /compilation?\s+(is\s+)?fail(ing|ed|s)?/i,
+  /npm\s+(install|start|run|build)\s+(is\s+)?fail(ing|ed)?/i,
+  // Additional error indicators
+  /something\s+(is\s+)?(still\s+)?broken/i,
+  /not\s+compiling/i,
+  /won('t|t)\s+(build|compile|start|run)/i,
 ];
 
 /**
@@ -172,7 +216,10 @@ export interface ClarificationRequest {
 }
 
 /**
- * Check if user prompt indicates error-fixing intent
+ * @deprecated Use classification.isErrorFix from classifyRequestSmart() instead.
+ * This function uses brittle regex patterns. The AI-based classifier is more accurate.
+ *
+ * Check if user prompt indicates error-fixing intent (legacy fallback)
  *
  * Returns true only if the prompt specifically asks for error fixing.
  * Does NOT trigger for general implementation requests like "add X" or "make Y the default".
@@ -364,6 +411,7 @@ export class PreVerifier {
     const result: PreVerificationResult = {
       isClean: true,
       totalErrors: 0,
+      jsonValidation: null,
       staticAnalysis: null,
       buildResult: null,
       lintResult: null,
@@ -387,11 +435,37 @@ export class PreVerifier {
     }
 
     try {
+      // CRITICAL: Check JSON files FIRST (package.json, tsconfig.json, etc.)
+      // JSON syntax errors can cause ALL other checks to fail silently
+      this.config.onProgress?.('[PreVerify] Checking JSON syntax (package.json, tsconfig.json)...');
+      result.jsonValidation = await this.validateJsonFiles();
+
+      if (!result.jsonValidation.success) {
+        result.isClean = false;
+        result.totalErrors += result.jsonValidation.errors.length;
+        this.config.onProgress?.(`[PreVerify] ⚠ Found ${result.jsonValidation.errors.length} JSON syntax error(s)`);
+
+        // SHORT-CIRCUIT: If package.json has errors, don't bother running build/tsc
+        // They will fail or hang anyway because npm can't parse the broken JSON
+        const hasPackageJsonError = result.jsonValidation.errors.some(
+          e => e.file === 'package.json'
+        );
+        if (hasPackageJsonError) {
+          this.config.onProgress?.('[PreVerify] ⚠ package.json has syntax errors - skipping build checks');
+          result.summary = this.buildSummary(result);
+          result.errorDetails = this.buildErrorDetails(result);
+          result.shouldProceed = true; // There ARE errors to fix
+          result.requiresApproval = true;
+          result.duration = Date.now() - startTime;
+          return result; // Return early with JSON errors
+        }
+      }
+
       // Check if this is a JS-only project
       const isJSOnly = await this.eslintRunner.isJSOnlyProject();
       result.isJSOnlyProject = isJSOnly;
 
-      // Run static analysis first (most comprehensive)
+      // Run static analysis (most comprehensive)
       if (this.config.runStaticAnalysis) {
         if (isJSOnly && this.config.useESLintFallback) {
           // JS-only project: use ESLint instead of tsc
@@ -492,6 +566,82 @@ export class PreVerifier {
   }
 
   /**
+   * Validate critical JSON files (package.json, tsconfig.json, etc.)
+   * JSON syntax errors can cause all other checks to fail silently
+   */
+  async validateJsonFiles(): Promise<JsonValidationResult> {
+    const errors: JsonValidationError[] = [];
+    const criticalJsonFiles = [
+      'package.json',
+      'tsconfig.json',
+      'tsconfig.node.json',
+      'jsconfig.json',
+      '.eslintrc.json',
+      'tailwind.config.json',
+      'vite.config.json',
+    ];
+
+    this.config.onProgress?.('[PreVerify] Checking JSON files for syntax errors...');
+
+    for (const filename of criticalJsonFiles) {
+      try {
+        const content = await this.webcontainer.fs.readFile(filename, 'utf-8');
+        this.config.onProgress?.(`[PreVerify] Validating ${filename}...`);
+
+        try {
+          JSON.parse(content);
+          // JSON is valid - no action needed
+        } catch (parseError) {
+          // Extract line/column from JSON parse error if possible
+          const errMsg = parseError instanceof Error ? parseError.message : 'Invalid JSON';
+
+          // Try to extract position from error message (e.g., "at position 123")
+          const positionMatch = errMsg.match(/position\s+(\d+)/i);
+          let line: number | undefined;
+          let column: number | undefined;
+
+          if (positionMatch) {
+            const position = parseInt(positionMatch[1], 10);
+            // Calculate line and column from position
+            const lines = content.slice(0, position).split('\n');
+            line = lines.length;
+            column = lines[lines.length - 1].length + 1;
+          }
+
+          errors.push({
+            file: filename,
+            message: errMsg,
+            line,
+            column,
+          });
+
+          // Log the error prominently
+          this.config.onProgress?.(`[PreVerify] ❌ JSON SYNTAX ERROR in ${filename}: ${errMsg}`);
+          console.error(`[PreVerify] JSON syntax error in ${filename}:`, errMsg);
+        }
+      } catch (readError) {
+        // File doesn't exist or can't be read - that's OK for optional files
+        // But log it if it's package.json (required file)
+        if (filename === 'package.json') {
+          console.warn(`[PreVerify] Could not read ${filename}:`, readError);
+          this.config.onProgress?.(`[PreVerify] ⚠ Could not read ${filename}`);
+        }
+      }
+    }
+
+    if (errors.length === 0) {
+      this.config.onProgress?.('[PreVerify] ✓ All JSON files are valid');
+    } else {
+      this.config.onProgress?.(`[PreVerify] Found ${errors.length} JSON syntax error(s)`);
+    }
+
+    return {
+      success: errors.length === 0,
+      errors,
+    };
+  }
+
+  /**
    * Quick check - only runs static analysis
    */
   async quickCheck(): Promise<{ isClean: boolean; errors: number; summary: string }> {
@@ -518,6 +668,7 @@ export class PreVerifier {
     const result: PreVerificationResult = {
       isClean: true,
       totalErrors: 0,
+      jsonValidation: null, // FIXED: Was missing this field
       staticAnalysis: null,
       buildResult: null,
       lintResult: null,
@@ -536,6 +687,31 @@ export class PreVerifier {
     this.config.onProgress?.('[PreVerify] Running unified verification...');
 
     try {
+      // CRITICAL: Check JSON files FIRST even in unified mode
+      // JSON syntax errors can cause all other checks to fail silently
+      this.config.onProgress?.('[PreVerify] Checking JSON syntax...');
+      result.jsonValidation = await this.validateJsonFiles();
+
+      if (!result.jsonValidation.success) {
+        result.isClean = false;
+        result.totalErrors += result.jsonValidation.errors.length;
+        this.config.onProgress?.(`[PreVerify] ⚠ Found ${result.jsonValidation.errors.length} JSON syntax error(s)`);
+
+        // SHORT-CIRCUIT: If package.json has errors, don't bother running unified checks
+        const hasPackageJsonError = result.jsonValidation.errors.some(
+          e => e.file === 'package.json'
+        );
+        if (hasPackageJsonError) {
+          this.config.onProgress?.('[PreVerify] ⚠ package.json has syntax errors - skipping other checks');
+          result.summary = `Found ${result.totalErrors} error(s): ${result.jsonValidation.errors.length} JSON syntax error(s)`;
+          result.errorDetails = this.buildJsonErrorSection(result.jsonValidation.errors);
+          result.shouldProceed = true;
+          result.requiresApproval = true;
+          result.duration = Date.now() - startTime;
+          return result;
+        }
+      }
+
       const unifiedVerifier = new UnifiedVerifier(this.webcontainer, {
         phases: {
           typeCheck: this.config.runStaticAnalysis,
@@ -553,10 +729,27 @@ export class PreVerifier {
 
       result.unifiedResult = await unifiedVerifier.verify();
 
-      result.isClean = result.unifiedResult.success;
-      result.totalErrors = result.unifiedResult.totalErrors;
-      result.summary = result.unifiedResult.summary;
-      result.errorDetails = result.unifiedResult.report;
+      // FIXED: Don't overwrite isClean/totalErrors if JSON validation already found errors
+      // Instead, combine the results
+      const hadJsonErrors = result.jsonValidation && !result.jsonValidation.success;
+      const jsonErrorCount = result.jsonValidation?.errors.length || 0;
+
+      // isClean is false if EITHER JSON validation OR unified verification failed
+      result.isClean = result.unifiedResult.success && !hadJsonErrors;
+      result.totalErrors = result.unifiedResult.totalErrors + jsonErrorCount;
+
+      // Build combined summary and error details
+      if (hadJsonErrors) {
+        // Prepend JSON errors to the report
+        const jsonSection = this.buildJsonErrorSection(result.jsonValidation!.errors);
+        result.summary = `Found ${result.totalErrors} error(s): ${jsonErrorCount} JSON syntax error(s)` +
+          (result.unifiedResult.totalErrors > 0 ? `, ${result.unifiedResult.totalErrors} other error(s)` : '');
+        result.errorDetails = jsonSection + '\n\n' + result.unifiedResult.report;
+      } else {
+        result.summary = result.unifiedResult.summary;
+        result.errorDetails = result.unifiedResult.report;
+      }
+
       result.shouldProceed = !result.isClean;
       result.requiresApproval = !result.isClean;
 
@@ -588,6 +781,11 @@ export class PreVerifier {
     }
 
     const parts: string[] = [];
+
+    // JSON validation errors (CRITICAL - show first)
+    if (result.jsonValidation && !result.jsonValidation.success) {
+      parts.push(`${result.jsonValidation.errors.length} JSON syntax error(s)`);
+    }
 
     // TypeScript errors
     if (result.staticAnalysis && !result.staticAnalysis.success) {
@@ -642,6 +840,21 @@ export class PreVerifier {
     }
 
     const sections: string[] = [];
+
+    // CRITICAL: JSON validation errors (show first - these break everything)
+    if (result.jsonValidation && result.jsonValidation.errors.length > 0) {
+      sections.push('## **CRITICAL** JSON Syntax Errors');
+      sections.push('These must be fixed FIRST as they can cause all other tools to fail.\n');
+
+      for (const error of result.jsonValidation.errors) {
+        const location = error.line
+          ? `Line ${error.line}${error.column ? `:${error.column}` : ''}`
+          : '';
+        sections.push(`### ${error.file}`);
+        sections.push(`- ${location}: ${error.message}`);
+        sections.push('- **Action Required**: Open the file and check for missing commas, brackets, or quotes.\n');
+      }
+    }
 
     // Static analysis errors (TypeScript)
     if (result.staticAnalysis && result.staticAnalysis.errors.length > 0) {
@@ -760,6 +973,27 @@ export class PreVerifier {
     }
 
     return sections.join('\n');
+  }
+
+  /**
+   * Build a formatted section for JSON validation errors
+   * Used by verifyUnified to prepend JSON errors to the report
+   */
+  private buildJsonErrorSection(errors: JsonValidationError[]): string {
+    const lines: string[] = [];
+    lines.push('## **CRITICAL** JSON Syntax Errors');
+    lines.push('These must be fixed FIRST as they can cause all other tools to fail.\n');
+
+    for (const error of errors) {
+      const location = error.line
+        ? `Line ${error.line}${error.column ? `:${error.column}` : ''}`
+        : '';
+      lines.push(`### ${error.file}`);
+      lines.push(`- ${location}: ${error.message}`);
+      lines.push('- **Action Required**: Open the file and check for missing commas, brackets, or quotes.\n');
+    }
+
+    return lines.join('\n');
   }
 }
 

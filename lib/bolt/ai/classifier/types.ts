@@ -60,6 +60,13 @@ export interface ClassificationResult {
 
   /** Indicators for mega-complex mode (if applicable) */
   megaComplexIndicators?: MegaComplexIndicators;
+
+  /**
+   * Whether this is an error-fix request (debugging, fixing errors, etc.)
+   * When true, the system should run pre-verification and investigation
+   * before making any changes.
+   */
+  isErrorFix?: boolean;
 }
 
 /**
@@ -264,4 +271,17 @@ export const SCALE_KEYWORDS: string[] = [
 export const IMPLEMENTATION_KEYWORDS: string[] = [
   'build', 'create', 'implement', 'develop', 'make',
   'design', 'construct', 'generate', 'setup', 'set up',
+];
+
+/** Keywords/patterns indicating error-fix intent */
+export const ERROR_FIX_KEYWORDS: string[] = [
+  'fix', 'error', 'errors', 'bug', 'bugs', 'broken', 'breaking',
+  'debug', 'diagnose', 'failing', 'failed', 'fail',
+  'not working', 'doesn\'t work', 'won\'t work', 'cant work',
+  'still getting', 'keep getting', 'getting errors',
+  'build failing', 'build failed', 'compilation error',
+  'type error', 'runtime error', 'syntax error',
+  'undefined', 'null', 'crash', 'crashing',
+  'resolve', 'address', 'check for errors',
+  'what\'s wrong', 'whats wrong',
 ];

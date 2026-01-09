@@ -5,23 +5,45 @@
  *
  * @example
  * ```tsx
- * import { MegaComplexPanel, MegaComplexMessage, MegaComplexBadge } from '@/components/bolt/mega';
- *
- * <MegaComplexPanel
- *   state={orchestrationState}
- *   context={orchestrationContext}
- *   onApprove={handleApprove}
- *   onPause={handlePause}
- * />
- *
- * <MegaComplexMessage
- *   type="research"
- *   title="Research Complete"
- *   content="Found 5 competitors and 10 key features"
- *   onViewDetails={() => setActiveTab('research')}
- * />
+ * import {
+ *   MegaComplexPanel,
+ *   MegaComplexMessage,
+ *   TodoList,
+ *   CostDashboard,
+ *   ApprovalDialog,
+ *   ProgressIndicator,
+ * } from '@/components/bolt/mega';
  * ```
  */
 
+// Main Panel Components
 export { MegaComplexPanel } from './MegaComplexPanel';
 export { MegaComplexMessage, MegaComplexBadge, type MegaComplexMessageType } from './MegaComplexMessage';
+
+// Todo List Components
+export { TodoList, MiniTodoList, CurrentTodo } from './TodoList';
+
+// Cost Dashboard Components
+export { CostDashboard, MiniCostDisplay, CostBadge } from './CostDashboard';
+
+// Approval Dialog Components
+export {
+  ApprovalDialog,
+  ApprovalStatusBadge,
+  ApprovalCard,
+  ApprovalList,
+} from './ApprovalDialog';
+
+// Progress Indicator Components
+export {
+  ProgressIndicator,
+  MiniProgressBadge,
+  StageProgressCard,
+} from './ProgressIndicator';
+
+// Evidence Log Components (Investigation results display)
+export {
+  EvidenceLog,
+  EvidenceItem,
+  MiniEvidenceLog,
+} from './EvidenceLog';

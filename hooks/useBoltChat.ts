@@ -14,6 +14,12 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import type { WebContainer } from '@webcontainer/api';
 import type { BoltChatMessage, BoltAction, BoltStreamChunk } from '@/lib/bolt/types';
+// Todo system integration
+import {
+  useTodos,
+  type UseTodosReturn,
+} from '@/hooks/useTodos';
+import type { Todo, TodoProgress, TodoTokenSummary } from '@/lib/bolt/todos';
 import {
   buildFileTree,
   getRelevantFiles,
@@ -25,7 +31,7 @@ import {
   ActionQueue,
   createPlanExecutor,
   createPreVerifier,
-  isErrorFixIntent,
+  // isErrorFixIntent removed - now using AI-based classification.isErrorFix
   isVagueRequest,
   generateClarificationRequest,
   generateCleanProjectResponse,
@@ -72,6 +78,20 @@ import {
   areErrorsFixable,
 } from '@/lib/bolt/ai/planner';
 import type { VerificationResult } from '@/lib/bolt/execution/verifier';
+// Debugging pipeline for enhanced error analysis
+import {
+  analyzeErrorsQuick,
+  runDebugPipeline,
+  type RootCause,
+  type ErrorAnalysis,
+  type DebugPipelineResult,
+  type DebugPipelineProgress,
+} from '@/lib/bolt/debugging';
+// Investigation layer for read-before-edit enforcement
+import type {
+  InvestigationResult,
+  InvestigationFinding,
+} from '@/lib/bolt/investigation';
 import type { BoltConfig } from '@/lib/bolt/config';
 import { DEFAULT_BOLT_CONFIG } from '@/lib/bolt/config';
 
@@ -108,6 +128,21 @@ export interface UseBoltChatOptions {
    * Default: 3000ms
    */
   runtimeErrorCheckDelay?: number;
+  /**
+   * Function to flush pending editor changes to WebContainer before verification.
+   * Ensures any unsaved edits are written to disk before checking for errors.
+   */
+  flushPendingEdits?: () => Promise<void>;
+  /**
+   * Function to get errors from the dev server terminal output.
+   * These are parsed from Vite/ESBuild/npm errors in the terminal.
+   */
+  getTerminalErrors?: () => Array<{ type: string; message: string; file?: string; line?: number }>;
+  /**
+   * Function to clear terminal history after successful error fix.
+   * This prevents old errors from persisting in the terminal buffer.
+   */
+  clearTerminalErrors?: () => void;
 }
 
 export interface BuildError {
@@ -160,12 +195,24 @@ export interface UseBoltChatReturn {
   orchestrationContext: OrchestrationContext | null;
   orchestrationProgress: OrchestrationProgress | null;
   isMegaComplexMode: boolean;
+  // Orchestration data from each phase
+  researchData: unknown;
+  prdData: unknown;
+  architectureData: unknown;
+  // Phase-specific investigation results for mega-complex mode
+  phaseInvestigations: Record<string, InvestigationResult>;
   // Phase 3: Pre-verification approval state
   pendingPreVerification: PreVerificationResult | null;
   isPreVerifying: boolean;
   // Phase 3: Error tracking state
   baselineErrors: ErrorSnapshot | null;
   evidenceReport: string | null;
+  // Investigation layer state (read-before-edit)
+  investigationResult: InvestigationResult | null;
+  isInvestigating: boolean;
+  // Debug pipeline state
+  debugPipelineResult: DebugPipelineResult | null;
+  debugPipelineProgress: DebugPipelineProgress | null;
   // Actions
   sendMessage: (content: string) => Promise<void>;
   clearMessages: () => void;
@@ -190,6 +237,11 @@ export interface UseBoltChatReturn {
   // Phase 3: Pre-verification approval actions
   approveErrorFix: () => Promise<void>;
   cancelErrorFix: () => void;
+  // Todo system state
+  todos: Todo[];
+  currentTodo: Todo | null;
+  todoProgress: TodoProgress;
+  todoTokenSummary: TodoTokenSummary;
 }
 
 // =============================================================================
@@ -198,6 +250,54 @@ export interface UseBoltChatReturn {
 
 function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+/**
+ * Call the investigation API to analyze codebase before making changes
+ * This enforces the "read-before-edit" principle from the strategy guide
+ */
+async function callInvestigationAPI(
+  prompt: string,
+  mode: RequestMode,
+  projectContext: {
+    fileTree: string;
+    projectFiles: string[];
+    framework?: string;
+    styling?: string;
+    language?: { primary: 'typescript' | 'javascript'; hasTsConfig: boolean };
+    existingRelevantFiles?: Record<string, string>;
+  },
+  errors?: string[],
+  signal?: AbortSignal
+): Promise<InvestigationResult | null> {
+  try {
+    const response = await fetch('/api/bolt-investigate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt,
+        mode,
+        projectContext,
+        errors,
+      }),
+      signal,
+    });
+
+    if (!response.ok) {
+      console.warn('[useBoltChat] Investigation API failed:', response.status);
+      return null;
+    }
+
+    const data = await response.json();
+    return data.result as InvestigationResult;
+  } catch (error) {
+    if ((error as Error).name === 'AbortError') {
+      console.log('[useBoltChat] Investigation request aborted');
+    } else {
+      console.warn('[useBoltChat] Investigation API error:', error);
+    }
+    return null;
+  }
 }
 
 /**
@@ -335,6 +435,9 @@ export function useBoltChat({
   getRuntimeErrors,
   clearRuntimeErrors,
   runtimeErrorCheckDelay = 3000,
+  flushPendingEdits,
+  getTerminalErrors,
+  clearTerminalErrors,
 }: UseBoltChatOptions): UseBoltChatReturn {
   // Use config values with defaults
   const maxIterations = config.complexMode.maxIterations;
@@ -368,6 +471,12 @@ export function useBoltChat({
   // Phase 3: Error tracking state
   const [baselineErrors, setBaselineErrors] = useState<ErrorSnapshot | null>(null);
   const [evidenceReport, setEvidenceReport] = useState<string | null>(null);
+  // Investigation layer state (read-before-edit enforcement)
+  const [investigationResult, setInvestigationResult] = useState<InvestigationResult | null>(null);
+  const [isInvestigating, setIsInvestigating] = useState(false);
+  // Debug pipeline state (full 7-phase debugging)
+  const [debugPipelineResult, setDebugPipelineResult] = useState<DebugPipelineResult | null>(null);
+  const [debugPipelineProgress, setDebugPipelineProgress] = useState<DebugPipelineProgress | null>(null);
   // Phase 3: Refs for error tracking components
   const errorTrackerRef = useRef<ErrorTracker | null>(null);
   const rollbackControllerRef = useRef<RollbackController | null>(null);
@@ -380,6 +489,12 @@ export function useBoltChat({
   const [orchestrationState, setOrchestrationState] = useState<OrchestrationState | null>(null);
   const [orchestrationContext, setOrchestrationContext] = useState<OrchestrationContext | null>(null);
   const [orchestrationProgress, setOrchestrationProgress] = useState<OrchestrationProgress | null>(null);
+  // Orchestration data from each phase
+  const [researchData, setResearchData] = useState<unknown>(null);
+  const [prdData, setPrdData] = useState<unknown>(null);
+  const [architectureData, setArchitectureData] = useState<unknown>(null);
+  // Phase-specific investigation results for mega-complex mode
+  const [phaseInvestigations, setPhaseInvestigations] = useState<Record<string, InvestigationResult>>({});
   const orchestratorRef = useRef<Orchestrator | null>(null);
   const planContextRef = useRef<{
     projectContext: { fileTree: string; framework: string; styling: string } | null;
@@ -397,6 +512,9 @@ export function useBoltChat({
     actionQueueRef.current = new ActionQueue(null, {});
   }
   const actionQueue = actionQueueRef.current;
+
+  // Todo system integration - tracks task progress visibly
+  const todoSystem = useTodos('simple');
 
   /**
    * Handle terminal output - detect build errors
@@ -639,11 +757,19 @@ export function useBoltChat({
       });
       setClassification(requestClassification);
 
+      // Initialize todos for this request mode
+      todoSystem.initTodos({
+        mode: requestClassification.mode,
+        prompt: content.trim(),
+        complexityScore: requestClassification.estimatedFiles,
+      });
+
       console.log('[useBoltChat] Classification:', {
         mode: requestClassification.mode,
         confidence: requestClassification.confidence,
         domains: requestClassification.domains,
         reasoning: requestClassification.reasoning,
+        isErrorFix: requestClassification.isErrorFix,
       });
 
       // Check for vague requests first - these need clarification
@@ -677,16 +803,230 @@ export function useBoltChat({
       // Phase 1 + Phase 3: Pre-Change Verification with User Approval
       // If the user's intent suggests error fixing, verify FIRST before making changes
       // Skip if called from approveErrorFix (to avoid circular loop)
-      const errorFixIntent = isErrorFixIntent(content.trim(), true); // Enable debug logging
+      // NOTE: Using AI-based classification.isErrorFix instead of regex patterns for better accuracy
+      const errorFixIntent = requestClassification.isErrorFix === true;
       if (errorFixIntent && !skipPreVerificationRef.current) {
         console.log('[useBoltChat] Error-fix intent detected, running pre-verification...');
+
+        // CRITICAL: Add user message to chat IMMEDIATELY so user sees their message
+        const userMessage: BoltChatMessage = {
+          id: generateId(),
+          role: 'user',
+          content: content.trim(),
+          timestamp: Date.now(),
+        };
+
+        // Add a "thinking/analyzing" assistant message that shows progress
+        const analyzingMessageId = generateId();
+        const analyzingMessage: BoltChatMessage = {
+          id: analyzingMessageId,
+          role: 'assistant',
+          content: '🔍 **Analyzing project for errors...**\n\nI\'m checking your project for issues before making any changes.\n\n- Syncing editor changes...',
+          timestamp: Date.now(),
+          status: 'streaming', // Shows as "thinking"
+        };
+
+        setMessages(prev => [...prev, userMessage, analyzingMessage]);
+
+        // Show visual indicator that we're analyzing
         setIsPreVerifying(true);
-        setLoadingMessage('Running pre-change verification...');
+        setLoadingMessage('Syncing editor changes...');
+
+        // Helper to update the analyzing message
+        const updateAnalyzingMessage = (newContent: string) => {
+          setMessages(prev => prev.map(m =>
+            m.id === analyzingMessageId
+              ? { ...m, content: newContent }
+              : m
+          ));
+        };
+
+        // CRITICAL: Flush any pending editor changes before verification
+        // This ensures the WebContainer has the latest file contents
+        if (flushPendingEdits) {
+          try {
+            await flushPendingEdits();
+            onTerminalOutput?.(`\x1b[36m[PreVerify] Synced pending editor changes\x1b[0m\r\n`);
+            updateAnalyzingMessage('🔍 **Analyzing project for errors...**\n\nI\'m checking your project for issues before making any changes.\n\n- ✓ Synced editor changes\n- Checking JSON files...');
+          } catch (flushError) {
+            console.warn('[useBoltChat] Failed to flush pending edits:', flushError);
+          }
+        }
+
+        setLoadingMessage('Analyzing project for errors...');
+
+        // =================================================================
+        // FAST PATH: Check terminal errors from dev server FIRST
+        // This avoids running slow npm/tsc processes when errors are
+        // already visible in the terminal from the running dev server
+        // =================================================================
+        if (getTerminalErrors) {
+          const terminalErrors = getTerminalErrors();
+          if (terminalErrors.length > 0) {
+            console.log('[useBoltChat] Found errors in terminal output:', terminalErrors);
+            onTerminalOutput?.(`\x1b[33m[PreVerify] Found ${terminalErrors.length} error(s) in dev server output\x1b[0m\r\n`);
+
+            // Build error report from terminal errors
+            const errorDetails = terminalErrors.map(e => {
+              const location = e.file ? `${e.file}${e.line ? `:${e.line}` : ''}` : '';
+              return `- [${e.type.toUpperCase()}] ${location ? `${location}: ` : ''}${e.message}`;
+            }).join('\n');
+
+            // Create a PreVerificationResult from terminal errors
+            const terminalErrorResult: PreVerificationResult = {
+              isClean: false,
+              totalErrors: terminalErrors.length,
+              jsonValidation: null,
+              staticAnalysis: null,
+              buildResult: null,
+              lintResult: null,
+              testResult: null,
+              eslintResult: null,
+              targetedTestResult: null,
+              unifiedResult: null,
+              summary: `Found ${terminalErrors.length} error(s) from dev server`,
+              errorDetails: `## Dev Server Errors\n\nThese errors were detected in the terminal output from the running dev server:\n\n${errorDetails}`,
+              shouldProceed: true,
+              duration: 0,
+              requiresApproval: true,
+              isJSOnlyProject: false,
+            };
+
+            // Update analyzing message to show we found errors
+            updateAnalyzingMessage(`🔍 **Analyzing project for errors...**\n\n- ✓ Synced editor changes\n- ⚠ Found ${terminalErrors.length} error(s) in dev server output`);
+
+            // Store result and show error report
+            setPendingPreVerification(terminalErrorResult);
+            pendingFixPromptRef.current = content.trim();
+
+            // Replace analyzing message with error report
+            setMessages((prev) => prev.map(m =>
+              m.id === analyzingMessageId
+                ? {
+                    ...m,
+                    content: generateErrorReportResponse(terminalErrorResult),
+                    status: 'complete' as const,
+                  }
+                : m
+            ));
+            setIsPreVerifying(false);
+            setIsLoading(false); // CRITICAL: Reset isLoading so approveErrorFix's sendMessage can proceed
+            setLoadingMessage('');
+            onTerminalOutput?.(`\x1b[33m[PreVerify] Found ${terminalErrors.length} error(s) from dev server - awaiting approval to fix\x1b[0m\r\n`);
+            return; // Exit early - we have errors from terminal
+          }
+        }
+
+        // Also check runtime errors from the browser
+        if (getRuntimeErrors) {
+          const runtimeErrors = getRuntimeErrors();
+          if (runtimeErrors.length > 0) {
+            console.log('[useBoltChat] Found runtime errors:', runtimeErrors);
+            onTerminalOutput?.(`\x1b[33m[PreVerify] Found ${runtimeErrors.length} runtime error(s) in browser\x1b[0m\r\n`);
+
+            // Build error report from runtime errors
+            const errorDetails = runtimeErrors.map(e => {
+              const location = e.source ? `${e.source}${e.line ? `:${e.line}` : ''}` : '';
+              return `- [${e.type?.toUpperCase() || 'ERROR'}] ${location ? `${location}: ` : ''}${e.message}`;
+            }).join('\n');
+
+            // Create a PreVerificationResult from runtime errors
+            const runtimeErrorResult: PreVerificationResult = {
+              isClean: false,
+              totalErrors: runtimeErrors.length,
+              jsonValidation: null,
+              staticAnalysis: null,
+              buildResult: null,
+              lintResult: null,
+              testResult: null,
+              eslintResult: null,
+              targetedTestResult: null,
+              unifiedResult: null,
+              summary: `Found ${runtimeErrors.length} runtime error(s) in browser`,
+              errorDetails: `## Runtime Errors\n\nThese errors were detected in the browser console:\n\n${errorDetails}`,
+              shouldProceed: true,
+              duration: 0,
+              requiresApproval: true,
+              isJSOnlyProject: false,
+            };
+
+            // Update analyzing message
+            updateAnalyzingMessage(`🔍 **Analyzing project for errors...**\n\n- ✓ Synced editor changes\n- ⚠ Found ${runtimeErrors.length} runtime error(s) in browser`);
+
+            // Store result and show error report
+            setPendingPreVerification(runtimeErrorResult);
+            pendingFixPromptRef.current = content.trim();
+
+            // Replace analyzing message with error report
+            setMessages((prev) => prev.map(m =>
+              m.id === analyzingMessageId
+                ? {
+                    ...m,
+                    content: generateErrorReportResponse(runtimeErrorResult),
+                    status: 'complete' as const,
+                  }
+                : m
+            ));
+            setIsPreVerifying(false);
+            setIsLoading(false); // CRITICAL: Reset isLoading so approveErrorFix's sendMessage can proceed
+            setLoadingMessage('');
+            onTerminalOutput?.(`\x1b[33m[PreVerify] Found ${runtimeErrors.length} runtime error(s) - awaiting approval to fix\x1b[0m\r\n`);
+            return; // Exit early - we have runtime errors
+          }
+        }
+
+        // No errors found in terminal or runtime, run full verification
+        onTerminalOutput?.(`\x1b[36m[PreVerify] No errors in terminal/runtime, running full verification...\x1b[0m\r\n`);
+
+        // Initialize todo for pre-verification phase
+        todoSystem.addTodo(
+          'Running pre-change verification',
+          'Running pre-change verification...',
+          'investigate'
+        );
+
+        // Track verification steps for the analyzing message
+        const verificationSteps: string[] = ['✓ Synced editor changes', '✓ Checked dev server output'];
+        const completedPhases = new Set<string>(); // Track which phases we've already shown
+
+        const updateProgress = (phase: string, step: string) => {
+          // Only add if we haven't shown this phase yet
+          if (completedPhases.has(phase)) return;
+          completedPhases.add(phase);
+
+          verificationSteps.push(step);
+          const stepsText = verificationSteps.map(s => `- ${s}`).join('\n');
+          updateAnalyzingMessage(`🔍 **Analyzing project for errors...**\n\nI'm checking your project for issues before making any changes.\n\n${stepsText}`);
+        };
 
         const preVerifier = createPreVerifier(webcontainer, {
           onProgress: (msg) => {
             setLoadingMessage(msg);
-            onTerminalOutput?.(`\x1b[36m[PreVerify] ${msg}\x1b[0m\r\n`);
+            onTerminalOutput?.(`\x1b[36m${msg}\x1b[0m\r\n`);
+
+            // Update the analyzing message based on progress (deduplicated by phase)
+            if (msg.includes('Checking JSON') || msg.includes('Validating')) {
+              updateProgress('json', 'Checking JSON files...');
+            } else if (msg.includes('TypeScript') || msg.includes('tsc')) {
+              updateProgress('typescript', 'Running TypeScript analysis...');
+            } else if (msg.includes('npm run build') || msg.includes('fresh build')) {
+              updateProgress('build', 'Running build check...');
+            } else if (msg.includes('lint') && !msg.includes('stylelint')) {
+              updateProgress('lint', 'Running lint check...');
+            } else if (msg.includes('JSON syntax error') || msg.includes('JSON SYNTAX ERROR')) {
+              // Show JSON error found
+              const match = msg.match(/in\s+(\S+):/);
+              const file = match ? match[1] : 'file';
+              updateProgress('json-error', `⚠ JSON syntax error in ${file}`);
+            } else if (msg.includes('Found') && msg.includes('error')) {
+              // Show error count (but only once per type)
+              const match = msg.match(/Found\s+(\d+)\s+(\w+)/);
+              if (match) {
+                const count = match[1];
+                const type = match[2];
+                updateProgress(`found-${type}`, `⚠ Found ${count} ${type}`);
+              }
+            }
           },
         });
 
@@ -714,6 +1054,7 @@ export function useBoltChat({
           preVerifyResult = {
             isClean: true,
             totalErrors: 0,
+            jsonValidation: null,
             staticAnalysis: null,
             buildResult: null,
             lintResult: null,
@@ -730,29 +1071,35 @@ export function useBoltChat({
           };
         }
 
-        // Add user message
-        const userMessage: BoltChatMessage = {
-          id: generateId(),
-          role: 'user',
-          content: content.trim(),
-          timestamp: Date.now(),
-        };
-        setMessages((prev) => [...prev, userMessage]);
+        // Mark pre-verification todo as complete
+        todoSystem.completeTodo('Running pre-change verification');
+
+        // NOTE: User message was already added at the start of the error-fix flow
+        // Do NOT add it again here to avoid duplicates
+
+        // DEBUG: Log detailed pre-verification result
+        console.log('[useBoltChat] Pre-verification result:', {
+          isClean: preVerifyResult.isClean,
+          totalErrors: preVerifyResult.totalErrors,
+          jsonValidation: preVerifyResult.jsonValidation,
+          summary: preVerifyResult.summary,
+        });
 
         if (preVerifyResult.isClean) {
           // Project is clean - NO errors to fix
           // Report this and STOP - don't make any changes
           console.log('[useBoltChat] Pre-verification: Project is clean, no changes needed');
 
-          const cleanResponse: BoltChatMessage = {
-            id: generateId(),
-            role: 'assistant',
-            content: generateCleanProjectResponse(),
-            timestamp: Date.now(),
-            status: 'complete',
-          };
-
-          setMessages((prev) => [...prev, cleanResponse]);
+          // REPLACE the analyzing message with the clean response
+          setMessages((prev) => prev.map(m =>
+            m.id === analyzingMessageId
+              ? {
+                  ...m,
+                  content: generateCleanProjectResponse(),
+                  status: 'complete' as const,
+                }
+              : m
+          ));
           setIsPreVerifying(false);
           setLoadingMessage('');
 
@@ -768,17 +1115,18 @@ export function useBoltChat({
         setPendingPreVerification(preVerifyResult);
         pendingFixPromptRef.current = content.trim();
 
-        // Show error report and ask for approval
-        const errorReportResponse: BoltChatMessage = {
-          id: generateId(),
-          role: 'assistant',
-          content: generateErrorReportResponse(preVerifyResult),
-          timestamp: Date.now(),
-          status: 'complete',
-        };
-
-        setMessages((prev) => [...prev, errorReportResponse]);
+        // REPLACE the analyzing message with the error report
+        setMessages((prev) => prev.map(m =>
+          m.id === analyzingMessageId
+            ? {
+                ...m,
+                content: generateErrorReportResponse(preVerifyResult),
+                status: 'complete' as const,
+              }
+            : m
+        ));
         setIsPreVerifying(false);
+        setIsLoading(false); // CRITICAL: Reset isLoading so approveErrorFix's sendMessage can proceed
         setLoadingMessage('');
 
         // EXIT - wait for user to click "Approve Fix" button
@@ -911,17 +1259,161 @@ export function useBoltChat({
           setOrchestrationState(orchestrator.state);
           setOrchestrationContext(orchestrator.context);
 
-          // Note: The actual execution happens via API routes that use the OrchestrationRunner
-          // For now, we just set up the client-side orchestrator for state tracking
-          // The user will need to approve each step via the UI
+          // Start the orchestration execution loop
           orchestrator.send({
             type: 'START_RESEARCH',
             payload: { prompt: content.trim() },
           });
 
-          setIsLoading(false);
-          setLoadingMessage('');
-          return; // Exit - orchestration UI will handle the rest
+          // Execute the orchestration flow via API routes
+          const executeOrchestration = async () => {
+            // Helper function to run investigation before each phase
+            const investigateForPhase = async (phaseName: string, phasePrompt: string): Promise<InvestigationResult | null> => {
+              onTerminalOutput?.(`\x1b[36m[Investigation] Analyzing codebase for ${phaseName} phase...\x1b[0m\r\n`);
+              try {
+                const investigation = await callInvestigationAPI(
+                  phasePrompt,
+                  'mega-complex',
+                  {
+                    fileTree,
+                    projectFiles: [],
+                    framework,
+                    styling,
+                    language,
+                  }
+                );
+
+                if (investigation?.success) {
+                  // Store investigation result for this phase
+                  setPhaseInvestigations((prev) => ({
+                    ...prev,
+                    [phaseName]: investigation,
+                  }));
+                  onTerminalOutput?.(`\x1b[36m[Investigation] ${phaseName}: Found ${investigation.filesToRead.required.length} relevant files\x1b[0m\r\n`);
+                }
+                return investigation;
+              } catch (error) {
+                onTerminalOutput?.(`\x1b[33m[Investigation] ${phaseName}: Investigation skipped (${error instanceof Error ? error.message : 'error'})\x1b[0m\r\n`);
+                return null;
+              }
+            };
+
+            try {
+              // Step 1: Research
+              setLoadingMessage('Researching domain...');
+              const researchResponse = await fetch('/api/research', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  action: 'plan',
+                  prompt: content.trim(),
+                }),
+              });
+
+              if (!researchResponse.ok) {
+                throw new Error('Research planning failed');
+              }
+
+              const researchPlan = await researchResponse.json();
+              setResearchData(researchPlan); // Store for MegaComplexPanel
+              orchestrator.send({
+                type: 'RESEARCH_COMPLETE',
+                payload: { sessionId: researchPlan.sessionId || 'research_session' },
+              });
+
+              // Check if paused or needs approval
+              if (orchestrator.state === 'awaiting-approval' || orchestrator.state === 'paused') {
+                setIsLoading(false);
+                setLoadingMessage('');
+                return; // Wait for user action
+              }
+
+              // INVESTIGATION: Before PRD generation
+              setLoadingMessage('Investigating codebase for PRD...');
+              await investigateForPhase('prd', `Generate product requirements for: ${content.trim()}`);
+
+              // Step 2: PRD Generation
+              setLoadingMessage('Generating product requirements...');
+              orchestrator.send({ type: 'START_PRODUCT_DEFINITION' });
+
+              const prdResponse = await fetch('/api/bolt-prd', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  researchData: researchPlan,
+                  productName: content.trim().slice(0, 50),
+                }),
+              });
+
+              if (!prdResponse.ok) {
+                throw new Error('PRD generation failed');
+              }
+
+              const prdResult = await prdResponse.json();
+              setPrdData(prdResult.prd); // Store for MegaComplexPanel
+              orchestrator.send({
+                type: 'PRODUCT_DEFINED',
+                payload: { prdId: prdResult.prd?.id || 'prd_generated' },
+              });
+
+              // Check if paused or needs approval
+              const currentState = orchestrator.state as string;
+              if (currentState === 'awaiting-approval' || currentState === 'paused') {
+                setIsLoading(false);
+                setLoadingMessage('');
+                return;
+              }
+
+              // INVESTIGATION: Before Architecture generation
+              setLoadingMessage('Investigating codebase for Architecture...');
+              await investigateForPhase('architecture', `Design technical architecture for: ${prdResult.prd?.name || content.trim()}`);
+
+              // Step 3: Architecture Generation
+              setLoadingMessage('Designing architecture...');
+              orchestrator.send({ type: 'START_ARCHITECTURE' });
+
+              const archResponse = await fetch('/api/bolt-architecture', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  prd: prdResult.prd,
+                  projectContext: { fileTree, framework, styling },
+                }),
+              });
+
+              if (!archResponse.ok) {
+                throw new Error('Architecture generation failed');
+              }
+
+              const archResult = await archResponse.json();
+              setArchitectureData(archResult.architecture); // Store for MegaComplexPanel
+              orchestrator.send({
+                type: 'ARCHITECTURE_COMPLETE',
+                payload: { archId: archResult.architecture?.id || 'arch_generated' },
+              });
+
+              // INVESTIGATION: Before Implementation
+              setLoadingMessage('Investigating codebase for Implementation...');
+              await investigateForPhase('implementation', `Implement features from architecture: ${archResult.architecture?.name || 'generated architecture'}`);
+
+              // Implementation phases would continue here...
+              setIsLoading(false);
+              setLoadingMessage('');
+
+            } catch (error) {
+              console.error('[useBoltChat] Orchestration error:', error);
+              orchestrator.send({
+                type: 'ERROR',
+                payload: { message: error instanceof Error ? error.message : 'Orchestration failed' },
+              });
+              setIsLoading(false);
+              setLoadingMessage('');
+            }
+          };
+
+          // Run orchestration in background
+          executeOrchestration();
+          return; // Exit - orchestration will run asynchronously
         }
 
         // For complex mode, generate a plan first instead of direct execution
@@ -984,9 +1476,50 @@ export function useBoltChat({
 
         // For non-complex modes, proceed with direct generation
         setIsLoading(true);
+
+        // CRITICAL: Run investigation BEFORE generating code
+        // This enforces "read-before-edit" from the strategy guide
+        setIsInvestigating(true);
+        setLoadingMessage('Investigating codebase...');
+        onTerminalOutput?.(`\x1b[36m[Investigation] Analyzing codebase before making changes...\x1b[0m\r\n`);
+
+        let investigation: InvestigationResult | null = null;
+        try {
+          investigation = await callInvestigationAPI(
+            content.trim(),
+            requestClassification.mode,
+            {
+              fileTree,
+              projectFiles: existingFiles.map(f => f.path),
+              framework,
+              styling,
+              language,
+            },
+            undefined, // no errors for normal requests
+            abortControllerRef.current?.signal
+          );
+
+          if (investigation?.success) {
+            setInvestigationResult(investigation);
+            onTerminalOutput?.(`\x1b[36m[Investigation] Found ${investigation.filesToRead.required.length} files to read, ${investigation.findings.length} findings\x1b[0m\r\n`);
+
+            // Log files identified for reading
+            for (const file of investigation.filesToRead.required.slice(0, 5)) {
+              onTerminalOutput?.(`\x1b[36m[Investigation]   → ${file.filePath}: ${file.reason}\x1b[0m\r\n`);
+            }
+          } else {
+            onTerminalOutput?.(`\x1b[33m[Investigation] Investigation skipped or failed, proceeding without\x1b[0m\r\n`);
+          }
+        } catch (invError) {
+          console.warn('[useBoltChat] Investigation failed, continuing without:', invError);
+          onTerminalOutput?.(`\x1b[33m[Investigation] Failed: ${invError instanceof Error ? invError.message : 'Unknown error'}\x1b[0m\r\n`);
+        } finally {
+          setIsInvestigating(false);
+        }
+
         setLoadingMessage('Generating code...');
 
-        // Call the API with classification for intelligent handling
+        // Call the API with classification and investigation results for intelligent handling
         const response = await fetch('/api/bolt-generate', {
           method: 'POST',
           headers: {
@@ -998,6 +1531,13 @@ export function useBoltChat({
             projectContext,
             conversationHistory,
             classification: requestClassification,
+            // Pass investigation results to inform code generation
+            investigation: investigation?.success ? {
+              filesToRead: investigation.filesToRead,
+              findings: investigation.findings,
+              suggestedApproach: investigation.suggestedApproach,
+              suggestedTodos: investigation.suggestedTodos,
+            } : undefined,
           }),
           signal: abortControllerRef.current.signal,
         });
@@ -1603,9 +2143,21 @@ Please analyze these errors and fix them. Make sure to:
    * This continues the fix flow after user reviews the error report
    */
   const approveErrorFix = useCallback(async () => {
-    if (!pendingPreVerification || !webcontainer) return;
+    console.log('[useBoltChat] approveErrorFix called', {
+      hasPendingPreVerification: !!pendingPreVerification,
+      hasWebcontainer: !!webcontainer,
+    });
+
+    if (!pendingPreVerification || !webcontainer) {
+      console.log('[useBoltChat] approveErrorFix: early return - missing dependencies');
+      return;
+    }
 
     const savedPreVerification = pendingPreVerification;
+    console.log('[useBoltChat] approveErrorFix: processing', {
+      jsonValidation: savedPreVerification.jsonValidation,
+      totalErrors: savedPreVerification.totalErrors,
+    });
 
     // Clear pending state
     setPendingPreVerification(null);
@@ -1619,6 +2171,160 @@ Please analyze these errors and fix them. Make sure to:
       timestamp: Date.now(),
     };
     setMessages((prev) => [...prev, approvalMessage]);
+
+    // CRITICAL: Check if package.json has errors
+    // If so, we CANNOT run npm/tsc commands - they will hang!
+    // Skip all npm-dependent operations and go straight to generating the fix
+    const hasPackageJsonError = savedPreVerification.jsonValidation?.errors.some(
+      e => e.file === 'package.json'
+    ) ?? false;
+
+    if (hasPackageJsonError) {
+      console.log('[useBoltChat] approveErrorFix: package.json error detected, using fast path');
+      onTerminalOutput?.(`\x1b[33m[ErrorFix] package.json has syntax errors - skipping npm-dependent checks\x1b[0m\r\n`);
+      onTerminalOutput?.(`\x1b[36m[ErrorFix] Generating fix for JSON syntax error...\x1b[0m\r\n`);
+
+      // Add a visible "working" message so user knows something is happening
+      const workingMessageId = generateId();
+      const workingMessage: BoltChatMessage = {
+        id: workingMessageId,
+        role: 'assistant',
+        content: '🔧 **Fixing JSON syntax error...**\n\nReading the file and generating the fix.',
+        timestamp: Date.now(),
+        status: 'streaming',
+      };
+      setMessages((prev) => [...prev, workingMessage]);
+      setIsGeneratingPlan(true);
+      setLoadingMessage('Fixing JSON syntax error...');
+
+      // Create a simple fix prompt for JSON errors
+      const jsonErrors = savedPreVerification.jsonValidation?.errors || [];
+      const fixPrompt = `Please fix the following JSON syntax error(s) in the project:
+
+${jsonErrors.map(e => `**${e.file}** (${e.line ? `Line ${e.line}` : 'unknown location'}):
+- Error: ${e.message}
+- Action: Check for missing commas, brackets, quotes, or trailing commas`).join('\n\n')}
+
+**Instructions:**
+1. Read the file(s) with errors first
+2. Fix the JSON syntax error (usually a missing comma, extra comma, or missing bracket)
+3. Ensure the JSON is valid after the fix`;
+
+      // Skip pre-verification (already done)
+      skipPreVerificationRef.current = true;
+
+      try {
+        console.log('[useBoltChat] approveErrorFix: calling sendMessage with fix prompt');
+
+        // Remove the working message before sendMessage adds its own
+        setMessages((prev) => prev.filter(m => m.id !== workingMessageId));
+
+        // CRITICAL: Ensure isLoading is false so sendMessage can proceed
+        setIsLoading(false);
+        await sendMessage(fixPrompt);
+        console.log('[useBoltChat] approveErrorFix: sendMessage completed');
+
+        // Clear terminal history so old errors don't persist on next check
+        clearTerminalErrors?.();
+        console.log('[useBoltChat] approveErrorFix: cleared terminal errors after successful JSON fix');
+      } catch (error) {
+        console.error('[useBoltChat] approveErrorFix: sendMessage failed', error);
+
+        // Show error to user
+        const errorMessage: BoltChatMessage = {
+          id: generateId(),
+          role: 'assistant',
+          content: `❌ **Error fixing JSON**\n\nFailed to generate fix: ${error instanceof Error ? error.message : 'Unknown error'}`,
+          timestamp: Date.now(),
+          status: 'complete',
+        };
+        setMessages((prev) => [...prev, errorMessage]);
+      } finally {
+        skipPreVerificationRef.current = false;
+        setIsGeneratingPlan(false);
+        setLoadingMessage('');
+      }
+
+      return; // Exit early - JSON fix doesn't need all the npm-dependent tracking
+    }
+
+    // FAST PATH #2: Terminal-sourced errors (from dev server output)
+    // These errors were detected from the running dev server, not from running npm commands.
+    // We should NOT try to create checkpoints or run ErrorTracker (which spawns npm/tsc).
+    // Detect terminal errors: jsonValidation is null but we have errors
+    const isTerminalSourcedError = savedPreVerification.jsonValidation === null &&
+                                   savedPreVerification.buildResult === null &&
+                                   savedPreVerification.totalErrors > 0;
+
+    if (isTerminalSourcedError) {
+      console.log('[useBoltChat] approveErrorFix: terminal-sourced error detected, using fast path');
+      onTerminalOutput?.(`\x1b[33m[ErrorFix] Detected error from dev server - using lightweight fix flow\x1b[0m\r\n`);
+      onTerminalOutput?.(`\x1b[36m[ErrorFix] Generating fix for ${savedPreVerification.totalErrors} error(s)...\x1b[0m\r\n`);
+
+      // Add a visible "working" message so user knows something is happening
+      const workingMessageId = generateId();
+      const workingMessage: BoltChatMessage = {
+        id: workingMessageId,
+        role: 'assistant',
+        content: `🔧 **Fixing ${savedPreVerification.totalErrors} error(s) from dev server...**\n\nReading the affected files and generating fixes.`,
+        timestamp: Date.now(),
+        status: 'streaming',
+      };
+      setMessages((prev) => [...prev, workingMessage]);
+      setIsGeneratingPlan(true);
+      setLoadingMessage('Fixing dev server errors...');
+
+      // Create a fix prompt from the error details
+      const fixPrompt = `Please fix the following error(s) detected from the dev server:
+
+${savedPreVerification.errorDetails}
+
+**Instructions:**
+1. Read the affected file(s) first to understand the context
+2. Fix the syntax or compilation error(s)
+3. Ensure the code compiles correctly after the fix
+4. Make minimal changes - only fix what's broken`;
+
+      // Skip pre-verification (already done)
+      skipPreVerificationRef.current = true;
+
+      try {
+        console.log('[useBoltChat] approveErrorFix: calling sendMessage with terminal error fix prompt');
+
+        // Remove the working message before sendMessage adds its own
+        setMessages((prev) => prev.filter(m => m.id !== workingMessageId));
+
+        // CRITICAL: Ensure isLoading is false so sendMessage can proceed
+        setIsLoading(false);
+        await sendMessage(fixPrompt);
+        console.log('[useBoltChat] approveErrorFix: sendMessage completed for terminal errors');
+
+        // Clear terminal history so old errors don't persist on next check
+        clearTerminalErrors?.();
+        console.log('[useBoltChat] approveErrorFix: cleared terminal errors after successful terminal fix');
+      } catch (error) {
+        console.error('[useBoltChat] approveErrorFix: sendMessage failed for terminal errors', error);
+
+        // Show error to user
+        const errorMessage: BoltChatMessage = {
+          id: generateId(),
+          role: 'assistant',
+          content: `❌ **Error fixing dev server errors**\n\nFailed to generate fix: ${error instanceof Error ? error.message : 'Unknown error'}`,
+          timestamp: Date.now(),
+          status: 'complete',
+        };
+        setMessages((prev) => [...prev, errorMessage]);
+      } finally {
+        skipPreVerificationRef.current = false;
+        setIsGeneratingPlan(false);
+        setLoadingMessage('');
+      }
+
+      return; // Exit early - terminal errors don't need npm-dependent tracking
+    }
+
+    // Normal flow for non-JSON, non-terminal errors (npm commands will work)
+    onTerminalOutput?.(`\x1b[36m[ErrorFix] Initializing error tracking...\x1b[0m\r\n`);
 
     // Phase 3: Initialize error tracking components
     errorTrackerRef.current = createErrorTracker(webcontainer, {
@@ -1640,10 +2346,32 @@ Please analyze these errors and fix them. Make sure to:
     });
 
     // Phase 4: Initialize CheckpointManager for named restore points
-    checkpointManagerRef.current = new CheckpointManager(webcontainer, {
+    checkpointManagerRef.current = new CheckpointManager({
       maxCheckpoints: 10,
-      autoCheckpoint: true,
-      onProgress: (msg) => onTerminalOutput?.(`\x1b[36m${msg}\x1b[0m\r\n`),
+      readFile: async (path) => {
+        try {
+          const content = await webcontainer.fs.readFile(path, 'utf-8');
+          return content;
+        } catch {
+          return null;
+        }
+      },
+      writeFile: async (path, content) => {
+        await webcontainer.fs.writeFile(path, content, 'utf-8');
+      },
+      deleteFile: async (path) => {
+        try {
+          await webcontainer.fs.rm(path);
+        } catch {
+          // Ignore if file doesn't exist
+        }
+      },
+      onCheckpointCreated: (checkpoint) => {
+        onTerminalOutput?.(`\x1b[36m[Checkpoint] Created: ${checkpoint.name}\x1b[0m\r\n`);
+      },
+      onCheckpointRestored: (checkpoint, count) => {
+        onTerminalOutput?.(`\x1b[36m[Checkpoint] Restored ${count} files from: ${checkpoint.name}\x1b[0m\r\n`);
+      },
     });
 
     // Phase 4: Initialize EvidenceReporter for evidence-based completion
@@ -1666,7 +2394,7 @@ Please analyze these errors and fix them. Make sure to:
     }
 
     // Create a checkpoint before starting error fixes
-    await checkpointManagerRef.current.createCheckpoint('before-error-fix', 'Pre-fix checkpoint');
+    await checkpointManagerRef.current.createCheckpoint('before-error-fix', [], { description: 'Pre-fix checkpoint' });
     onTerminalOutput?.(`\x1b[36m[Checkpoint] Created restore point: before-error-fix\x1b[0m\r\n`);
 
     // Capture baseline error count (from pre-verification result)
@@ -1683,12 +2411,165 @@ Please analyze these errors and fix them. Make sure to:
       });
     }
 
-    // Create a detailed fix prompt using the error details
-    const fixPrompt = `Please fix the following errors that were detected in the project:
+    // Use FULL debugging pipeline for enhanced error analysis (7-phase pipeline)
+    let debugPipelineRes: DebugPipelineResult | null = null;
+    try {
+      // Extract raw error strings from the pre-verification result
+      const rawErrors = savedPreVerification.errorDetails
+        .split('\n')
+        .filter(line => line.trim().length > 0);
+
+      // Get file contents from webcontainer for context
+      const fileContents = new Map<string, string>();
+      const projectFilesList: string[] = [];
+      if (webcontainer) {
+        const fileTreeData = await buildFileTree(webcontainer);
+        // Extract file paths from errors and read them
+        const errorFiles = new Set<string>();
+        for (const err of rawErrors) {
+          const match = err.match(/([^\s:]+\.(tsx?|jsx?|css|scss)):(\d+)/);
+          if (match) {
+            errorFiles.add(match[1]);
+          }
+        }
+        for (const filePath of Array.from(errorFiles).slice(0, 10)) {
+          try {
+            const file = await webcontainer.fs.readFile(filePath, 'utf-8');
+            fileContents.set(filePath, file);
+            projectFilesList.push(filePath);
+          } catch {
+            // File may not exist
+          }
+        }
+      }
+
+      // Run FULL debug pipeline (Collect → Analyze → Read → Identify → Plan → Execute → Verify)
+      if (rawErrors.length > 0) {
+        onTerminalOutput?.(`\x1b[36m[DebugPipeline] Starting full 7-phase debug pipeline...\x1b[0m\r\n`);
+
+        debugPipelineRes = await runDebugPipeline(
+          rawErrors,
+          projectFilesList,
+          fileContents,
+          {
+            maxFilesToRead: 10,
+            autoApply: false, // Don't auto-apply, let AI handle it
+            analysisModel: 'flash-lite',
+          },
+          // Progress callback to show pipeline steps in terminal
+          (progress: DebugPipelineProgress) => {
+            setDebugPipelineProgress(progress);
+            onTerminalOutput?.(`\x1b[36m[DebugPipeline] Step: ${progress.currentStep} (${progress.percentage}%) - ${progress.message}\x1b[0m\r\n`);
+          }
+        );
+
+        setDebugPipelineResult(debugPipelineRes);
+
+        if (debugPipelineRes.success) {
+          onTerminalOutput?.(`\x1b[36m[DebugPipeline] Analysis: ${debugPipelineRes.analysis.stats.totalErrors} errors, ${debugPipelineRes.analysis.stats.uniqueFiles} files\x1b[0m\r\n`);
+          if (debugPipelineRes.rootCause) {
+            onTerminalOutput?.(`\x1b[36m[DebugPipeline] Root cause: ${debugPipelineRes.rootCause.description} (confidence: ${Math.round(debugPipelineRes.rootCause.confidence * 100)}%)\x1b[0m\r\n`);
+          }
+          if (debugPipelineRes.fixPlan) {
+            onTerminalOutput?.(`\x1b[36m[DebugPipeline] Fix plan: ${debugPipelineRes.fixPlan.fixes.length} fix(es) identified\x1b[0m\r\n`);
+          }
+        }
+      }
+    } catch (debugError) {
+      console.warn('[useBoltChat] Debug pipeline failed, using basic error details:', debugError);
+      onTerminalOutput?.(`\x1b[33m[DebugPipeline] Pipeline failed: ${debugError instanceof Error ? debugError.message : 'Unknown error'}\x1b[0m\r\n`);
+    }
+
+    // CRITICAL: Run investigation BEFORE generating fix code
+    // This enforces the "read-before-edit" principle for error fixes too
+    setIsInvestigating(true);
+    setLoadingMessage('Investigating codebase for error fix...');
+    onTerminalOutput?.(`\x1b[36m[Investigation] Analyzing codebase before fixing errors...\x1b[0m\r\n`);
+
+    let investigation: InvestigationResult | null = null;
+    try {
+      // Build project context
+      const fileTree = await buildFileTree(webcontainer);
+      const framework = detectFramework(fileTree);
+      const styling = detectStyling(fileTree);
+      const language = await detectLanguage(webcontainer);
+
+      // Extract error strings for investigation context
+      const errorStrings = savedPreVerification.errorDetails
+        .split('\n')
+        .filter(line => line.trim().length > 0)
+        .slice(0, 20); // Limit to 20 most relevant errors
+
+      investigation = await callInvestigationAPI(
+        `Fix the following errors: ${savedPreVerification.summary}`,
+        'moderate', // Error fixes are moderate complexity
+        {
+          fileTree,
+          projectFiles: [], // Will be populated by investigation
+          framework,
+          styling,
+          language,
+        },
+        errorStrings // Pass errors for targeted investigation
+      );
+
+      if (investigation?.success) {
+        setInvestigationResult(investigation);
+        onTerminalOutput?.(`\x1b[36m[Investigation] Found ${investigation.filesToRead.required.length} files to read, ${investigation.findings.length} findings\x1b[0m\r\n`);
+
+        // Log files identified for reading
+        for (const file of investigation.filesToRead.required.slice(0, 5)) {
+          onTerminalOutput?.(`\x1b[36m[Investigation]   → ${file.filePath}: ${file.reason}\x1b[0m\r\n`);
+        }
+      } else {
+        onTerminalOutput?.(`\x1b[33m[Investigation] Investigation skipped or failed, proceeding with debug pipeline results\x1b[0m\r\n`);
+      }
+    } catch (invError) {
+      console.warn('[useBoltChat] Investigation failed in approveErrorFix, continuing without:', invError);
+      onTerminalOutput?.(`\x1b[33m[Investigation] Failed: ${invError instanceof Error ? invError.message : 'Unknown error'}\x1b[0m\r\n`);
+    } finally {
+      setIsInvestigating(false);
+    }
+
+    // Create an enhanced fix prompt using full debug pipeline results when available
+    let fixPrompt: string;
+    if (debugPipelineRes?.rootCause) {
+      // Build fix plan details if available
+      const fixPlanDetails = debugPipelineRes.fixPlan
+        ? `\n**Suggested Fix Plan:**\n${debugPipelineRes.fixPlan.fixes.map((f, i) =>
+            `${i + 1}. ${f.file}:${f.line || 'N/A'} - ${f.description}`
+          ).join('\n')}`
+        : '';
+
+      fixPrompt = `Please fix the following errors that were detected in the project.
+
+**Root Cause Analysis (from full debug pipeline):**
+${debugPipelineRes.rootCause.description}
+- File: ${debugPipelineRes.rootCause.file}${debugPipelineRes.rootCause.line ? `:${debugPipelineRes.rootCause.line}` : ''}
+- Confidence: ${Math.round(debugPipelineRes.rootCause.confidence * 100)}%
+
+**Error Summary:**
+- Total errors: ${debugPipelineRes.analysis.stats.totalErrors}
+- Affected files: ${debugPipelineRes.analysis.stats.uniqueFiles}
+- Primary error type: ${debugPipelineRes.analysis.stats.primaryType}
+- Estimated root causes: ${debugPipelineRes.analysis.stats.estimatedRootCauses}
+${fixPlanDetails}
+
+**Detailed Errors:**
+${savedPreVerification.errorDetails}
+
+**Instructions:**
+1. Fix the root cause first, as it may resolve cascading errors
+2. Follow the suggested fix plan above when available
+3. Make targeted changes only to files with actual errors
+4. Do not modify files that don't have errors`;
+    } else {
+      fixPrompt = `Please fix the following errors that were detected in the project:
 
 ${savedPreVerification.errorDetails}
 
 Make targeted changes only to the files with actual errors. Do not modify files that don't have errors.`;
+    }
 
     // Set flag to skip pre-verification (already done)
     skipPreVerificationRef.current = true;
@@ -1846,12 +2727,24 @@ Make targeted changes only to the files with actual errors. Do not modify files 
     orchestrationContext,
     orchestrationProgress,
     isMegaComplexMode,
+    // Orchestration data from each phase
+    researchData,
+    prdData,
+    architectureData,
+    // Phase-specific investigation results for mega-complex mode
+    phaseInvestigations,
     // Phase 3: Pre-verification approval state
     pendingPreVerification,
     isPreVerifying,
     // Phase 3: Error tracking state
     baselineErrors,
     evidenceReport,
+    // Investigation layer state (read-before-edit)
+    investigationResult,
+    isInvestigating,
+    // Debug pipeline state
+    debugPipelineResult,
+    debugPipelineProgress,
     // Actions
     sendMessage,
     clearMessages,
@@ -1876,5 +2769,10 @@ Make targeted changes only to the files with actual errors. Do not modify files 
     // Phase 3: Pre-verification approval actions
     approveErrorFix,
     cancelErrorFix,
+    // Todo system state
+    todos: todoSystem.todos,
+    currentTodo: todoSystem.currentTodo,
+    todoProgress: todoSystem.progress,
+    todoTokenSummary: todoSystem.tokenSummary,
   };
 }

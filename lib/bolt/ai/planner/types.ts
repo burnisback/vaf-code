@@ -142,6 +142,12 @@ export interface PlanGenerationRequest {
 
   /** Conversation history for context */
   conversationHistory?: { role: string; content: string }[];
+
+  /** Request mode for model selection (affects cost) */
+  mode?: 'simple' | 'moderate' | 'complex' | 'mega-complex';
+
+  /** Complexity score for fine-grained model selection */
+  complexityScore?: number;
 }
 
 /**
